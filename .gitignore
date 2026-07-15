@@ -1,7 +1,7 @@
 # General
 data/
 testing/
-testing*
+test*
 output/
 
 # SVM files
@@ -22,6 +22,11 @@ output/
 *.gpkg
 *.qgz
 *.xml
+
+# Output file types
+*.png
+*.jpg
+*.pdf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
