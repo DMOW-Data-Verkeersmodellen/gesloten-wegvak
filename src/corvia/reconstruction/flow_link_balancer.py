@@ -1,0 +1,293 @@
+"""
+reconstruction/flow_link_balancer.py
+==============================
+Flow-conservation reconstruction using direct and higher-degree neighbours.
+
+A single class handles both upstream and downstream directions and any degree
+of neighbour expansion.  The recursion works by tracking a running sign that
+flips each time a "competing" (negative-contribution) branch is followed.
+The traversal direction also flips on competing branches to keep the
+expansion moving away from the target section and avoid circular dependencies.
+
+Flow balance equations
+----------------------
+Upstream (entry node):
+    S = sum(upstream_in) - sum(upstream_out)
+
+Downstream (exit node):
+    S = sum(downstream_out) - sum(downstream_in)
+
+At each additional degree, every neighbour term is expanded one level further
+using the same logic.  The sign carried into the recursive call determines
+whether that term adds or subtracts from the total.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional, Set, Tuple, TYPE_CHECKING
+import numpy as np
+import pandas as pd
+
+from corvia.network_states.flow import FlowStore as FlowStore
+
+if TYPE_CHECKING:
+    from corvia.framework.network import Network
+    from corvia.framework.topology import RoadSection
+
+
+class FlowLinkBalancer():
+    """
+    Reconstruct a section's volume from neighbouring section volumes using
+    flow conservation, extended to arbitrary neighbour depth.
+
+    At degree 1 the equation is a simple node flow balance.  At degree 2 each
+    neighbour term is itself expanded one level further.  The recursion
+    continues until ``degree`` levels have been expanded or a base-case
+    (data lookup) is reached.
+
+    Parameters
+    ----------
+    direction : str
+        ``"upstream"`` to reconstruct from the entry node,
+        ``"downstream"`` to reconstruct from the exit node.
+    degree : int, optional
+        Number of neighbour levels to expand.  Defaults to ``1``.
+        Degree 1 uses direct neighbours only; degree 2 uses neighbours of
+        neighbours, etc.
+    weight : float, optional
+        Override the computed default weight.  When not supplied, weight
+        decays as ``0.9 ** degree`` so that higher-degree reconstructions
+        are automatically trusted less.
+
+    Examples
+    --------
+    >>> m1 = FlowConservationReconstruction("upstream", degree=1)
+    >>> m2 = FlowConservationReconstruction("downstream", degree=2)
+    >>> pipeline.add_method(m1)
+    >>> pipeline.add_method(m2)
+    """
+
+    # Base weight before degree decay
+    _base_weight: float = 0.9
+
+    def __init__(
+        self,
+        direction: str,
+        degree: int = 1,
+        weight: Optional[float] = None,
+    ) -> None:
+        if direction not in ("upstream", "downstream"):
+            raise ValueError(
+                f"direction must be 'upstream' or 'downstream', got '{direction}'."
+            )
+        if degree < 1:
+            raise ValueError(f"degree must be >= 1, got {degree}.")
+
+        self.direction: str = direction
+        self.degree: int = degree
+        self.weight = weight if weight is not None else self._base_weight ** degree
+
+    @property
+    def name(self) -> str:
+        """str : Unique source label written to the observation store."""
+        return f"FlowLinkBalancer_{self.direction}_d{self.degree}"
+
+    # ------------------------------------------------------------------
+    # ReconstructionMethod interface
+    # ------------------------------------------------------------------
+
+    def reconstruct(
+        self,
+        network: Network,
+        flow_data: FlowStore,
+        periods: List[pd.Timestamp],
+        vehicle_types: List[str],
+    ) -> pd.DataFrame:
+        """
+        Produce reconstruction rows for all applicable sections.
+
+        A reconstruction is produced only when the recursive expansion can
+        reach a data value for every required branch.  Sections where any
+        branch returns ``None`` (missing data or cycle detected) are skipped.
+
+        Parameters
+        ----------
+        network : Network
+        store : FlowStore
+        periods : list of Timestamp
+        vehicle_types : list of str
+
+        Returns
+        -------
+        pd.DataFrame
+        """
+        rows = []
+
+        for section in network.sections.values():
+            for period in periods:
+                for vtype in vehicle_types:
+                    volume, volume_err = self._estimate(
+                        section=section,
+                        direction=self.direction,
+                        degree=self.degree,
+                        flow_data=flow_data,
+                        period=period,
+                        vtype=vtype,
+                        visited=frozenset(),
+                    )
+                    if not np.isnan(volume):
+                        rows.append(
+                            self._make_row(
+                                section.section_id, period, vtype, volume, volume_err=volume_err
+                            )
+                        )
+
+        return (
+            pd.DataFrame(rows, columns=FlowStore.COLUMNS) if rows else self._empty_result()
+        )
+
+    # ------------------------------------------------------------------
+    # Recursive core
+    # ------------------------------------------------------------------
+
+    def _estimate(
+        self,
+        section: RoadSection,
+        direction: str,
+        degree: int,
+        flow_data: FlowStore,
+        period: pd.Timestamp,
+        vtype: str,
+        visited: frozenset,
+    ) -> Tuple[float, float]:
+        """
+        Recursively estimate a section's signed volume contribution.
+
+        Parameters
+        ----------
+        section : RoadSection
+            The section to estimate.
+        direction : str
+            ``"upstream"`` or ``"downstream"`` — which node to balance at.
+        degree : int
+            Levels of expansion to perform. When 0, a data lookup is
+            performed instead of further expansion.
+        store : ObservationStore
+        period : Timestamp
+        vtype : str
+        visited : frozenset of str
+            Section IDs already on the current call path.  Used for cycle
+            detection.  A frozenset is used so each recursive branch carries
+            its own independent copy without explicit copying.
+
+        Returns
+        -------
+        tuple of float : volume, volume_err
+            The estimated volume and its error.
+            ``np.nan, np.nan`` when the expansion is infeasible 
+            (missing data, cycle, or no neighbours to expand from).
+        """
+        # Cycle guard
+        if section.section_id in visited:
+            return np.nan, np.nan
+
+        # Base case: look up the actual data
+        if degree == 0:
+            return flow_data.section_consensus(section.section_id, period, vtype, source_types=(FlowStore.SOURCE_OBS,))
+
+        # Determine which neighbour sets to expand and which direction
+        # the competing branches should recurse into
+        if direction == "upstream":
+            in_neighbours = section.upstream_in 
+            out_neighbours = section.upstream_out
+            if not in_neighbours:  # Do not expand beyond source node
+                return np.nan, np.nan
+        elif direction == "downstream":
+            in_neighbours = section.downstream_in
+            out_neighbours = section.downstream_out
+            if not out_neighbours:  # Do not expand beyond sink node
+                return np.nan, np.nan
+
+        # If no neighbours exist at this level, expansion is infeasible
+        if not in_neighbours and not out_neighbours:
+            return np.nan, np.nan
+
+        visited = visited | {section.section_id}
+
+        total_in = 0.0
+        total_out = 0.0
+        total_err2 = 0.0
+
+        # Positive branches: same sign, same direction
+        for s in in_neighbours:
+            v, v_err = self._estimate(
+                s, 'upstream', degree-1,
+                flow_data, period, vtype, visited,
+            )
+            if np.isnan(v):
+                return np.nan, np.nan
+            total_in += v
+            total_err2 += v_err ** 2
+
+        # Negative branches: flipped sign, flipped direction
+        for s in out_neighbours:
+            v, v_err = self._estimate(
+                s, 'downstream', degree-1,
+                flow_data, period, vtype, visited,
+            )
+            if np.isnan(v):
+                return np.nan, np.nan
+            total_out += v
+            total_err2 += v_err ** 2
+
+        if direction == 'upstream':
+            return (total_in - total_out), np.sqrt(total_err2)
+        elif direction == 'downstream':
+            return (total_out - total_in), np.sqrt(total_err2)
+
+    def _make_row( 
+        self,
+        section_id: str,
+        period_start: pd.Timestamp,
+        vehicle_type: str,
+        volume: float,
+        volume_err: float = np.nan,
+    ) -> dict: 
+        """
+        Build a single reconstruction row dictionary.
+
+        Parameters
+        ----------
+        section_id : str
+        period_start : Timestamp
+        vehicle_type : str
+        volume : float
+
+        Returns
+        -------
+        dict
+            Ready to be collected into a DataFrame and passed to
+            :meth:`~observations.ObservationStore.add_reconstruction`.
+        """
+        return {
+            "road_section_id":   section_id,
+            "timestamp":        period_start,
+            "vehicle_type":     vehicle_type,
+            "volume":           volume,
+            "volume_err":       volume_err,
+            "source_type":      FlowStore.SOURCE_REC,
+            "source_id":        self.name,
+            "outlier":          False,
+            "weight":           self.weight,
+        }
+
+    def _empty_result(self) -> pd.DataFrame:
+        """Return an empty DataFrame with the correct schema."""
+        return pd.DataFrame(columns=FlowStore.COLUMNS)
+
+    def __repr__(self) -> str:
+        return (
+            f"FlowBalanceReconstruction("
+            f"{self.direction}, "
+            f"degree={self.degree})"
+        )
