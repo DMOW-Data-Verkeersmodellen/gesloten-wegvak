@@ -12,6 +12,7 @@ from corvia.utils import compute_z_score, weighted_mean_and_error
 
 if TYPE_CHECKING:
     from corvia.framework.network import Network
+    from corvia.engine.validators import BaseValidator
 
 class FlowResolver:
     """Manages iterative adaptive multi-pass algorithms over network state models."""
@@ -19,7 +20,7 @@ class FlowResolver:
     def __init__(
         self, 
         reconstructors: List, 
-        z_threshold: float = 1.96, 
+        validator: BaseValidator,
         max_iterations: int = 3,
         name: Optional[str] = None,
         debug_plot: bool = False,
@@ -27,7 +28,7 @@ class FlowResolver:
     ) -> None:
         
         self.reconstructors = reconstructors
-        self.z_threshold = z_threshold
+        self.validator = validator
         self.max_iterations = max_iterations
         self.name = name
         self.debug_plot = debug_plot
@@ -114,27 +115,15 @@ class FlowResolver:
             df = store.dataframe
             
             # 2. Extract active raw observations to test
-            obs_mask = (df["source_type"] == FlowStore.SOURCE_OBS) & (~df["screening"].isin(["void"]))
+            obs_mask = (df["source_type"] == FlowStore.SOURCE_OBS) & (~df["screening"].isin(["void", "NA"]))
             obs_rows = df[obs_mask]
             if obs_rows.empty:
                 break
 
-            store.set_validation_state(obs_rows.index, "pending")
-
-            # 3. Construct matching alignment vectors using our new helper function
-            baseline_means, baseline_stds = self.compute_baselines(store, obs_rows.index)
+            store.set_validation_state(obs_rows.index, "pending")       
             
-            # 4. Invoke the clean, generic statistical filter
-            z_scores = compute_z_score(
-                observed_val=obs_rows["volume"],
-                observed_err=obs_rows["volume_err"],
-                baseline_mean=baseline_means,
-                baseline_std=baseline_stds
-            )
-            
-            # 5. Execute thresholding and classification choices
-            conforming_indices = z_scores[z_scores <= self.z_threshold].index
-            anomalies_indices = z_scores[z_scores > self.z_threshold].index
+            # 5. Execute validation and classification choices
+            conforming_indices, anomalies_indices = self.validator.validate(store, obs_rows.index)
             store.set_validation_state(obs_rows.index, "unresolved") # change this to intersect or something?
             store.set_validation_state(conforming_indices, "verified")
             store.set_validation_state(anomalies_indices, "rejected")
@@ -151,9 +140,9 @@ class FlowResolver:
                 .set_index(["source_id", "timestamp", "vehicle_type"])["validation"]
                 .sort_index()
             )
+
             detected_duplicate = False
             duplicate_iteration = None
-
             for prev_idx, prev_df_copy in snapshots[:-1]:
                 prev_validation = (
                     prev_df_copy[prev_df_copy["source_type"] == FlowStore.SOURCE_OBS]
