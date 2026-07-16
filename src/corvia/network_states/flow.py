@@ -27,7 +27,7 @@ class FlowStore():
                "volume", "volume_err", "source_type", "source_id", 
                "weight", "screening", "validation"]
     
-    SCREENING_STATES = {"unknown", "accepted", "disputed", "held", "void"}
+    SCREENING_STATES = {"unknown", "accepted", "disputed", "held", "void", "NA"}
     VALIDATION_STATES = {"pending", "verified", "unresolved", "rejected"}
 
     def __init__(self) -> None:
@@ -65,7 +65,8 @@ class FlowStore():
         """Sets the dynamic validation state ('verified', 'unresolved', 'rejected', 'pending') for given indices."""
         if state not in self.VALIDATION_STATES:
             raise ValueError(f"Invalid validation state: '{state}'. Must be one of {self.VALIDATION_STATES}")
-        if not indices.empty:
+        indices = pd.Index(indices)
+        if not indices.dropna().empty:
             self._df.loc[indices, "validation"] = state
 
     def clear_reconstructions(self) -> None:
@@ -135,6 +136,8 @@ class FlowStore():
 
         if not "volume_err" in records.columns:
             records["volume_err"] = np.nan  # Default to NaN if no error column is provided
+        if not "screening" in records.columns:
+            records["screening"] = "unknown"
         
         # Strip measurements from any location that couldn't be mapped
         records = records.dropna(subset=["road_section_id"])
@@ -143,7 +146,7 @@ class FlowStore():
         records["source_type"] = self.SOURCE_OBS
         records["source_id"] = "sensor:" + records["location_id"].astype(str)
         records["weight"] = 1.0
-        records["outlier"] = False
+        records["validation"] = "pending"
 
         self.append_estimates(records[self.COLUMNS])
 
