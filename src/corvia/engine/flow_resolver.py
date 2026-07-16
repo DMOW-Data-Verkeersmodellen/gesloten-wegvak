@@ -128,6 +128,20 @@ class FlowResolver:
             store.set_validation_state(conforming_indices, "verified")
             store.set_validation_state(anomalies_indices, "rejected")
 
+            validated_idx = pd.Index(conforming_indices).union(pd.Index(anomalies_indices)) 
+            failed_indices = obs_rows.index.difference(validated_idx)
+            if len(failed_indices) == len(obs_rows) and len(obs_rows) > 0:
+                print(
+                    f"CRITICAL: Reconstruction failed completely for all {len(obs_rows)} observations. "
+                    f"No baseline consensus could be computed. Breaking resolving loop."
+                )
+                break
+            elif len(failed_indices) > 0:
+                print(
+                    f"WARNING: Reconstruction failed to generate consensus baselines for {len(failed_indices)} "
+                    f"observations. These values remain in a 'pending' state."
+                )
+
             # 6. Track the history and look for convergence
             snapshots.append((iteration,store.dataframe.copy()))
     
@@ -163,6 +177,10 @@ class FlowResolver:
                 break
             else:
                 print(f"--> No convergence found, new outliers found: {list(anomalies_indices)}")
+        
+        else:
+            # Executes ONLY if the loop ran max_iterations and did not execute a 'break'
+            print(f"WARNING: FlowResolver reached maximum iterations ({self.max_iterations}) without reaching convergence.")
         
         if self.debug_plot:
             self.plot_iteration_summary(snapshots)
