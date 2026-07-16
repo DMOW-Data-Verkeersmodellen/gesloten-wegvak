@@ -139,7 +139,7 @@ class FlowResolver:
             elif len(failed_indices) > 0:
                 print(
                     f"WARNING: Reconstruction failed to generate consensus baselines for {len(failed_indices)} "
-                    f"observations. These values remain in a 'pending' state."
+                    f"observations. These values remain in a 'unresolved' state."
                 )
 
             # 6. Track the history and look for convergence
