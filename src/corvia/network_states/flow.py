@@ -25,14 +25,19 @@ class FlowStore():
 
     COLUMNS = ["road_section_id", "timestamp", "vehicle_type", 
                "volume", "volume_err", "source_type", "source_id", 
-               "weight", "outlier"]
-
+               "weight", "screening", "validation"]
+    
+    SCREENING_STATES = {"unknown", "accepted", "disputed", "held", "void"}
+    VALIDATION_STATES = {"pending", "verified", "unresolved", "rejected"}
 
     def __init__(self) -> None:
         self._df = self._create_empty_matrix()
 
     def _create_empty_matrix(self) -> pd.DataFrame:
         """Initializes schema using tight data types to optimize memory footprint."""
+        screening_type = pd.CategoricalDtype(categories=list(self.SCREENING_STATES))
+        validation_type = pd.CategoricalDtype(categories=list(self.VALIDATION_STATES))
+
         df = pd.DataFrame(columns=self.COLUMNS)
         df = pd.DataFrame({
             "road_section_id": pd.Series(dtype="string"),
@@ -43,7 +48,8 @@ class FlowStore():
             "source_type": pd.Series(dtype="category"),
             "source_id": pd.Series(dtype="string"),
             "weight": pd.Series(dtype="float32"),
-            "outlier": pd.Series(dtype="boolean")
+            "screening": pd.Series(dtype=screening_type),
+            "validation": pd.Series(dtype=validation_type)
         })
         # Explicit categories restrict memory expansion over large timelines
         df["vehicle_type"] = df["vehicle_type"].cat.set_categories(["PW", "VR"])
@@ -53,15 +59,14 @@ class FlowStore():
     @property
     def dataframe(self) -> pd.DataFrame:
         """pd.DataFrame: Access the underlying pandas matrix for analysis."""
-        return self._df
-    
-    def flag_outliers(self, indices: pd.Index | list | np.array) -> None:
-        """Flags rows as outliers."""
-        self._df.loc[indices, "outlier"] = True
+        return self._df.copy()
 
-    def unflag_outliers(self, indices: pd.Index | list | np.array) -> None:
-        """Unflags rows as outliers."""
-        self._df.loc[indices, "outlier"] = False
+    def set_validation_state(self, indices: pd.Index | list | np.array, state: str) -> None:
+        """Sets the dynamic validation state ('verified', 'unresolved', 'rejected', 'pending') for given indices."""
+        if state not in self.VALIDATION_STATES:
+            raise ValueError(f"Invalid validation state: '{state}'. Must be one of {self.VALIDATION_STATES}")
+        if not indices.empty:
+            self._df.loc[indices, "validation"] = state
 
     def clear_reconstructions(self) -> None:
         """Purges old reconstruction rows to clean up memory between iterative passes."""
@@ -70,7 +75,35 @@ class FlowStore():
     def append_estimates(self, df_to_append: pd.DataFrame) -> None:
         """Safely bulk-appends rows, casting columns back to expected categories."""
         df_copy = df_to_append.copy()
-        for col in ["source_type", "vehicle_type"]:
+
+        # 1. Check and validate "screening" values if present in incoming data
+        if "screening" in df_copy.columns:
+            incoming_screening = set(df_copy["screening"].dropna().unique())
+            invalid_screen = incoming_screening - self.SCREENING_STATES
+            if invalid_screen:
+                raise ValueError(
+                    f"Cannot append: 'screening' column contains invalid values: {invalid_screen}. "
+                    f"Must be one of {self.SCREENING_STATES}"
+                )
+        else:
+            # Fallback default if not supplied
+            df_copy["screening"] = "unknown"
+
+        # 2. Check and validate "validation" values if present in incoming data
+        if "validation" in df_copy.columns:
+            incoming_validation = set(df_copy["validation"].dropna().unique())
+            invalid_valid = incoming_validation - self.VALIDATION_STATES
+            if invalid_valid:
+                raise ValueError(
+                    f"Cannot append: 'validation' column contains invalid values: {invalid_valid}. "
+                    f"Must be one of {self.VALIDATION_STATES}"
+                )
+        else:
+            # Default state as requested
+            df_copy["validation"] = "pending"
+
+        # 3. Cast to Categories for memory optimization
+        for col in ["source_type", "vehicle_type", "screening", "validation"]:
             if col in df_copy.columns:
                 df_copy[col] = df_copy[col].astype("category")
         
@@ -144,9 +177,16 @@ class FlowStore():
             (self._df["road_section_id"] == road_section_id) &
             (self._df["timestamp"]       == timestamp) &
             (self._df["vehicle_type"]    == vehicle_type) &
-            (self._df["outlier"] == False) &
-            (self._df["source_type"].isin(source_types))
+            (self._df["source_type"].isin(source_types)) &
+            (self._df["validation"] != "rejected")
         )
+
+        if self.SOURCE_OBS in source_types:
+            mask = mask & (
+                (self._df["source_type"] != self.SOURCE_OBS) |
+                (self._df["screening"].isin(["accepted", "disputed", "unknown"]))
+            )
+
         sub = self._df[mask].dropna(subset=["volume"])
         if sub.empty:
             return np.nan, np.nan

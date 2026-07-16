@@ -58,7 +58,7 @@ class FlowResolver:
         df = store.dataframe
         
         # 1. Isolate valid active reconstruction traces
-        recon_mask = (df["source_type"] == FlowStore.SOURCE_REC) & (~df["outlier"])
+        recon_mask = (df["source_type"] == FlowStore.SOURCE_REC) & (df["validation"] != "rejected")
         recon_rows = df[recon_mask].dropna(subset=["volume"])
         
         if recon_rows.empty:
@@ -114,10 +114,12 @@ class FlowResolver:
             df = store.dataframe
             
             # 2. Extract active raw observations to test
-            obs_mask = (df["source_type"] == FlowStore.SOURCE_OBS) & (~df["outlier"])
+            obs_mask = (df["source_type"] == FlowStore.SOURCE_OBS) & (~df["screening"].isin(["void"]))
             obs_rows = df[obs_mask]
             if obs_rows.empty:
                 break
+
+            store.set_validation_state(obs_rows.index, "pending")
 
             # 3. Construct matching alignment vectors using our new helper function
             baseline_means, baseline_stds = self.compute_baselines(store, obs_rows.index)
@@ -131,25 +133,50 @@ class FlowResolver:
             )
             
             # 5. Execute thresholding and classification choices
+            conforming_indices = z_scores[z_scores <= self.z_threshold].index
             anomalies_indices = z_scores[z_scores > self.z_threshold].index
-            store.flag_outliers(anomalies_indices)
+            store.set_validation_state(obs_rows.index, "unresolved") # change this to intersect or something?
+            store.set_validation_state(conforming_indices, "verified")
+            store.set_validation_state(anomalies_indices, "rejected")
 
-            # 6. Render grouped network snapshots diagnostics
-            if self.debug_plot:
-                snapshots.append((iteration,store.dataframe.copy()))
-                #for ts in periods:
-                #    for vtype in vehicle_types:
-                #        self.plot_iteration_snapshot(iteration, store, ts, vtype)
-            
+            # 6. Track the history and look for convergence
+            snapshots.append((iteration,store.dataframe.copy()))
+    
             if len(anomalies_indices) == 0:
-                print(f"-> Architecture converged cleanly at iteration {iteration}.")
-                if self.debug_plot:
-                    self.plot_iteration_summary(snapshots)
+                print(f"-> Architecture converged cleanly at iteration {iteration} (0 anomalies).")
+                break
+
+            current_validation = (
+                store.dataframe[store.dataframe["source_type"] == FlowStore.SOURCE_OBS]
+                .set_index(["source_id", "timestamp", "vehicle_type"])["validation"]
+                .sort_index()
+            )
+            detected_duplicate = False
+            duplicate_iteration = None
+
+            for prev_idx, prev_df_copy in snapshots[:-1]:
+                prev_validation = (
+                    prev_df_copy[prev_df_copy["source_type"] == FlowStore.SOURCE_OBS]
+                    .set_index(["source_id", "timestamp", "vehicle_type"])["validation"]
+                    .sort_index()
+                )
+                # Compare the validation categories row-by-row
+                if prev_validation.equals(current_validation):
+                    detected_duplicate = True
+                    duplicate_iteration = prev_idx
+                    break
+
+            if detected_duplicate:
+                if duplicate_iteration == iteration - 1:
+                    print(f"-> Convergence reached at iteration {iteration}: Outlier validation states have stabilized.")
+                else:
+                    print(f"-> Convergence stopped at iteration {iteration}: Detected an oscillation cycle (matches iteration {duplicate_iteration}).")
                 break
             else:
-                print(f"-> Isolated {len(anomalies_indices)} outlier sensor entries via Z-Score validation.")
-                print(f"   Target indices to flag: {list(anomalies_indices)}")
-
+                print(f"--> No convergence found, new outliers found: {list(anomalies_indices)}")
+        
+        if self.debug_plot:
+            self.plot_iteration_summary(snapshots)
         return store
     
     def set_plotting_restrictions(self, 
@@ -214,7 +241,7 @@ class FlowResolver:
                     (df["road_section_id"] == sec_id) &
                     (df["timestamp"] == timestamp) &
                     (df["vehicle_type"] == vehicle_type) &
-                    (df["outlier"] == False) &
+                    (df["validation"] != "rejected") &
                     (df["source_type"] == FlowStore.SOURCE_REC)
                 )
                 sub = df[mask].dropna(subset=["volume"])
@@ -252,12 +279,26 @@ class FlowResolver:
             # Sensor Observations
             for _, row in obs.iterrows():
                 x_loc = sec_to_x[row["road_section_id"]]
-                if row["outlier"]:
-                    ax1.errorbar(x_loc, row["volume"], yerr=row["volume_err"], fmt='x',
-                        color="#d62728", capsize=4, elinewidth=2, zorder=5, label="Observation - Outlier")
+
+                if row["validation"] == "rejected":
+                    colour = "#d62728"  # Red
+                    fmt = "x"
+                    label_str = "Observation - Rejected (Outlier)"
+                elif row["validation"] == "unresolved":
+                    colour = "#ff7f0e"  # Orange
+                    fmt = "^"          # Triangle
+                    label_str = "Observation - Unresolved"
                 else:
-                    ax1.errorbar(x_loc, row["volume"], yerr=row["volume_err"], fmt='o',
-                        color="#2ca02c", capsize=4, elinewidth=2, zorder=5, label="Observation - Valid")
+                    colour = "#2ca02c"  # Green
+                    fmt = "o"          # Circle
+                    label_str = "Observation - Verified"
+
+                if row["screening"] == "held":
+                    colour = "#8320f3"
+                    label_str = "Observation - HELD"
+                
+                ax1.errorbar(x_loc, row["volume"], yerr=row["volume_err"], fmt=fmt,
+                    color=colour, capsize=4, elinewidth=2, zorder=5, label=label_str)
                     
             ax1.set_ylabel("Flow Volume (Veh/hr)", fontsize=11)
             ax1.set_title(f"Pass {iteration}", fontweight="bold")
@@ -272,11 +313,27 @@ class FlowResolver:
                 base_std = reco_stds[x_loc]
                 delta = row["volume"] - base_m if not pd.isna(base_m) else np.nan
                 delta_std = np.sqrt(row["volume_err"]**2 + base_std**2) if not pd.isna(base_std) else np.nan
-                color = "#d62728" if row["outlier"] else "#2ca02c"
+
+                if row["validation"] == "rejected":
+                    colour = "#d62728"  # Red
+                    fmt = "x"
+                    label_str = "Observation - Rejected (Outlier)"
+                elif row["validation"] == "unresolved":
+                    colour = "#ff7f0e"  # Orange
+                    fmt = "^"          # Triangle
+                    label_str = "Observation - Unresolved"
+                else:
+                    colour = "#2ca02c"  # Green
+                    fmt = "o"          # Circle
+                    label_str = "Observation - Verified"
+
+                if row["screening"] == "held":
+                    colour = "#8320f3"
+                    label_str = "Observation - HELD"
                 
                 if not pd.isna(delta):
-                    ax2.vlines(x_loc, 0, delta, colors=color, alpha=0.4, linewidth=1, ls=':')
-                    ax2.errorbar(x_loc, delta, yerr=delta_std, color=color, elinewidth=2, capsize=5, zorder=3)
+                    ax2.vlines(x_loc, 0, delta, colors=colour, alpha=0.4, linewidth=1, ls=':')
+                    ax2.errorbar(x_loc, delta, yerr=delta_std, color=colour, fmt=fmt, elinewidth=2, capsize=5, zorder=3)
                     
             ax2.set_ylabel("Residual Delta (Veh/h)", fontsize=11)
             ax2.set_xticks(x_positions)
@@ -390,7 +447,7 @@ class FlowResolver:
                             (df["road_section_id"] == sec_id) &
                             (df["timestamp"] == timestamp) &
                             (df["vehicle_type"] == vehicle_type) &
-                            (df["outlier"] == False) &
+                            (df["validation"] != "rejected") &
                             (df["source_type"] == FlowStore.SOURCE_REC)
                         )
                         sub = df[mask].dropna(subset=["volume"])
@@ -425,12 +482,26 @@ class FlowResolver:
                         
                     for _, row in obs.iterrows():
                         x_loc = sec_to_x[row["road_section_id"]]
-                        if row["outlier"]:
-                            ax_vol.errorbar(x_loc, row["volume"], yerr=row["volume_err"], fmt='x',
-                                color="#d62728", capsize=4, elinewidth=2, zorder=5, label="Observation - Outlier")
+
+                        if row["validation"] == "rejected":
+                            colour = "#d62728"  # Red
+                            fmt = "x"
+                            label_str = "Observation - Rejected (Outlier)"
+                        elif row["validation"] == "unresolved":
+                            colour = "#ff7f0e"  # Orange
+                            fmt = "^"          # Triangle
+                            label_str = "Observation - Unresolved"
                         else:
-                            ax_vol.errorbar(x_loc, row["volume"], yerr=row["volume_err"], fmt='o',
-                                color="#2ca02c", capsize=4, elinewidth=2, zorder=5, label="Observation - Valid")
+                            colour = "#2ca02c"  # Green
+                            fmt = "o"          # Circle
+                            label_str = "Observation - Verified"
+
+                        if row["screening"] == "held":
+                            colour = "#8320f3"
+                            label_str = "Observation - HELD"
+
+                        ax_vol.errorbar(x_loc, row["volume"], yerr=row["volume_err"], fmt=fmt,
+                            color=colour, capsize=4, elinewidth=2, zorder=5, label=label_str)
                     
                     if col_idx == 0:
                         ax_vol.set_ylabel("Flow Volume (Veh/hr)", fontsize=11)
@@ -450,11 +521,27 @@ class FlowResolver:
                         base_std = reco_stds[x_loc]
                         delta = row["volume"] - base_m if not pd.isna(base_m) else np.nan
                         delta_std = np.sqrt(row["volume_err"]**2 + base_std**2) if not pd.isna(base_std) else np.nan
-                        color = "#d62728" if row["outlier"] else "#2ca02c"
+                        
+                        if row["validation"] == "rejected":
+                            colour = "#d62728"  # Red
+                            fmt = "x"
+                            label_str = "Observation - Rejected (Outlier)"
+                        elif row["validation"] == "unresolved":
+                            colour = "#ff7f0e"  # Orange
+                            fmt = "^"          # Triangle
+                            label_str = "Observation - Unresolved"
+                        else:
+                            colour = "#2ca02c"  # Green
+                            fmt = "o"          # Circle
+                            label_str = "Observation - Verified"
+
+                        if row["screening"] == "held":
+                            colour = "#8320f3"
+                            label_str = "Observation - HELD"
                         
                         if not pd.isna(delta):
-                            ax_res.vlines(x_loc, 0, delta, colors=color, alpha=0.4, linewidth=1, ls=':')
-                            ax_res.errorbar(x_loc, delta, yerr=delta_std, color=color, fmt='o', elinewidth=2, capsize=5, zorder=3)
+                            ax_res.vlines(x_loc, 0, delta, colors=colour, alpha=0.4, linewidth=1, ls=':')
+                            ax_res.errorbar(x_loc, delta, yerr=delta_std, color=colour, fmt=fmt, elinewidth=2, capsize=5, zorder=3)
                     
                     if col_idx == 0:
                         ax_res.set_ylabel("Residual Delta (Veh/h)", fontsize=11)

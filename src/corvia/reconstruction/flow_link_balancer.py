@@ -277,7 +277,8 @@ class FlowLinkBalancer():
             "volume_err":       volume_err,
             "source_type":      FlowStore.SOURCE_REC,
             "source_id":        self.name,
-            "outlier":          False,
+            "screening":        "unknown",
+            "validation":       "pending",
             "weight":           self.weight,
         }
 
