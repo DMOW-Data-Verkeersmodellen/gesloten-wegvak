@@ -90,8 +90,8 @@ def weighted_mean_and_error(values_arr, errors_arr, weights_arr=None, label=None
 def compute_z_score(
     observed_val: pd.Series,
     observed_err: pd.Series,
-    baseline_mean: pd.Series,
-    baseline_std: pd.Series
+    baseline_val: pd.Series,
+    baseline_err: pd.Series
 ) -> pd.Series:
     """
     Computes point-by-point 1-DoF Z-scores combining observation and baseline variances.
@@ -115,14 +115,14 @@ def compute_z_score(
     """
     # Ensure all series share identical index mapping for perfect vectorization
     assert observed_val.index.equals(observed_err.index), "Index mismatch on observations."
-    assert observed_val.index.equals(baseline_mean.index), "Index mismatch between observations and baseline."
-    assert observed_val.index.equals(baseline_std.index), "Index mismatch on baseline variances."
+    assert observed_val.index.equals(baseline_val.index), "Index mismatch between observations and baseline."
+    assert observed_val.index.equals(baseline_err.index), "Index mismatch on baseline variances."
 
     # Compute combined pool variance: σ²_total = σ²_obs + σ²_baseline
-    total_variance = (observed_err ** 2) + (baseline_std ** 2)
+    total_variance = ((observed_err ** 2) + (baseline_err ** 2)).replace(0, np.nan).fillna(1e-15)
 
     # Calculate vectorized absolute Z-score
-    z_scores = (observed_val - baseline_mean).abs() / total_variance.pow(0.5)
+    z_scores = (observed_val - baseline_val).abs() / total_variance.pow(0.5)
 
     # Mask out records where the initial variance was zero or invalid
     valid_variance_mask = total_variance > 0
