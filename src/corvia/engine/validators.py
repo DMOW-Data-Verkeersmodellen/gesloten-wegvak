@@ -10,6 +10,14 @@ from corvia.network_states.flow import FlowStore
 
 class BaseValidator(ABC):
     """Abstract Base Class for all network baseline validation strategies."""
+
+    # Small-sample bias-correction factors for MAD → consistent scale estimator
+    # (Rousseeuw & Croux, 1993). Converges to the standard 1.4826 asymptotic factor.
+    _MAD_CORRECTION_FACTORS = {
+        1: 1.196, 2: 1.495, 3: 1.363, 4: 1.206, 5: 1.200,
+        6: 1.140, 7: 1.129, 8: 1.107, 9: 1.093,
+    }
+    _MAD_ASYMPTOTIC_FACTOR = 1.4826
     
     @abstractmethod
     def validate(self, store: FlowStore, target_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
@@ -31,14 +39,25 @@ class BaseValidator(ABC):
         e = flow_df["volume_err"].to_numpy(dtype="float64")
         w = flow_df["weight"].to_numpy(dtype="float64")
         mean, std = utils.weighted_mean_and_error(v, e, w)
-        return pd.Series({"baseline_mean": mean, "baseline_std": std})
+        return pd.Series({"baseline": mean, "baseline_error": std})
     
     @staticmethod
-    def _calc_median_and_mad(flow_df: pd.DataFrame) -> pd.Series:
+    def _calc_median_and_mad(flow_df: pd.DataFrame, poisson_floor_factor: float = 1.0) -> pd.Series:
         volumes = flow_df["volume"].to_numpy(dtype="float64")
+        n = len(volumes)
+
         median = np.median(volumes)
-        mad = np.median(np.abs(volumes - median))
-        return pd.Series({"baseline_median": median, "baseline_mad": mad})
+        raw_mad = np.median(np.abs(volumes - median))
+
+        # Bias-correct so MAD is a consistent estimator of std, especially at small n
+        c_n = BaseValidator._MAD_CORRECTION_FACTORS.get(n, BaseValidator._MAD_ASYMPTOTIC_FACTOR)
+        mad = raw_mad * c_n
+
+        # Poisson-like counting-noise floor, scaled by volume magnitude.
+        poisson_floor = poisson_floor_factor * np.sqrt(max(median, 1.0))
+        mad = max(mad, poisson_floor)
+
+        return pd.Series({"baseline" : median, "baseline_error": mad})
 
 
 class ZScoreValidator(BaseValidator):
@@ -73,8 +92,8 @@ class ZScoreValidator(BaseValidator):
             lookup_map, 
             on=["road_section_id", "timestamp", "vehicle_type"], 
             how="left"
-        ).set_index('index')[["baseline_mean", "baseline_std"]]
-        baseline = baseline.rename(columns={"baseline_mean": "mean", "baseline_std": "std"})
+        ).set_index('index')[["baseline", "baseline_error"]]
+        baseline = baseline.rename(columns={"baseline": "mean", "baseline_error": "std"})
         
         # 4. Calculate Z Scores
         if self.use_errors and "volume_err" in obs_rows.columns:
@@ -82,7 +101,7 @@ class ZScoreValidator(BaseValidator):
             obs_err = obs_rows["volume_err"]
         else:
             #obs_err = pd.Series(np.nan, index=baseline.index)
-            obs_err = obs_rows["volume"] * 0.001  # Set observation error to small noise floor
+            obs_err = obs_rows["volume"] * 0.  # Set observation error to small noise floor
 
         z_scores = utils.compute_z_score(
             observed_val=obs_rows["volume"],
@@ -101,7 +120,7 @@ class ZScoreModifiedValidator(BaseValidator):
     """
     Modified Z-Score validation using Median and Median Absolute Deviation (MAD).
     """
-    def __init__(self, z_threshold: float = 1.96, use_errors: bool = True):
+    def __init__(self, z_threshold: float = 3.5, use_errors: bool = True):
         # 3.5 is the standard recommended threshold for modified Z-score outliers
         self.z_threshold = z_threshold
         self.use_errors = use_errors
@@ -130,8 +149,8 @@ class ZScoreModifiedValidator(BaseValidator):
             lookup_map, 
             on=["road_section_id", "timestamp", "vehicle_type"], 
             how="left"
-        ).set_index('index')[["baseline_median", "baseline_mad"]]
-        baseline = baseline.rename(columns={"baseline_median": "median", "baseline_mad": "mad"})
+        ).set_index('index')[["baseline", "baseline_error"]]
+        baseline = baseline.rename(columns={"baseline": "median", "baseline_error": "mad"})
         
 
         # 4. Calculate Modified Z Scores
@@ -140,7 +159,7 @@ class ZScoreModifiedValidator(BaseValidator):
             obs_err = obs_rows["volume_err"]
         else:
             #obs_err = pd.Series(np.nan, index=baseline.index)
-            obs_err = obs_rows["volume"] * 0.001  # Set observation error to small noise floor
+            obs_err = obs_rows["volume"] * 0.  # Set observation error to small noise floor
 
         modified_z_scores = 0.6745 * utils.compute_z_score(
             observed_val=obs_rows["volume"],
@@ -159,10 +178,12 @@ class RelativeErrorValidator(BaseValidator):
     """
     Validation based on relative percentage difference from consensus baseline mean.
     """
-    def __init__(self, max_percent_deviation: float = 2.0, use_errors: bool = True):
+    def __init__(self, max_percent_deviation: float = 2.0, use_median: bool = True, use_errors: bool = True):
         # Max allowed deviation (e.g. 30%)
         self.limit = max_percent_deviation / 100.0
+        self.use_median = use_median
         self.use_errors = use_errors
+        self._noise_floor = 10.
 
     def validate(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
         df = store.dataframe
@@ -180,25 +201,25 @@ class RelativeErrorValidator(BaseValidator):
         # 2. Compute baseline EXACTLY ONCE per unique spatial-temporal coordinate
         lookup_map = (
             recon_rows.groupby(["road_section_id", "timestamp", "vehicle_type"], observed=True)
-            .apply(self._calc_median_and_mad, include_groups=False)
+            .apply(self._calc_median_and_mad if self.use_median else self._calc_weighted_mean_and_std, include_groups=False)
         )
 
         # 3. Broadcast the unique baselines out to the investigated indices
         obs_coords = obs_rows[["road_section_id", "timestamp", "vehicle_type"]].reset_index()
-        baseline_median = obs_coords.merge(
+        baseline = obs_coords.merge(
             lookup_map, 
             on=["road_section_id", "timestamp", "vehicle_type"], 
             how="left"
-        ).set_index('index')["baseline_median"]
+        ).set_index('index')["baseline"]
         
 
         # 4. Check relative differences
-        diff_abs = (obs_rows["volume"] - baseline_median).abs()  
+        diff_abs = (obs_rows["volume"] - baseline).abs()  
         if self.use_errors and "volume_err" in obs_rows.columns:
             safe_err = obs_rows["volume_err"].fillna(0)
             diff_abs = diff_abs - safe_err
 
         # 5. Determine validation status
-        anomalies = diff_abs[diff_abs > baseline_median*self.limit].index
-        conforming = diff_abs[diff_abs <= baseline_median*self.limit].index
+        anomalies = diff_abs[diff_abs > (baseline*self.limit).clip(lower=self._noise_floor)].index
+        conforming = diff_abs[diff_abs <= (baseline*self.limit).clip(lower=self._noise_floor)].index
         return conforming, anomalies
