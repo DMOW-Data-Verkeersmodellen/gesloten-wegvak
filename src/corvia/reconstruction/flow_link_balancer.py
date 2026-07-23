@@ -69,28 +69,50 @@ class FlowLinkBalancer():
 
     # Base weight before degree decay
     _base_weight: float = 0.9
+    PRACTICAL_MAX_DEGREE: int = 5
 
     def __init__(
         self,
         direction: str,
-        degree: int = 1,
+        min_obs_degree: int = 1,
+        max_link_degree: int | float = 1,
         weight: Optional[float] = None,
+        allow_partial_fallback: bool = False,
     ) -> None:
-        if direction not in ("upstream", "downstream"):
-            raise ValueError(
-                f"direction must be 'upstream' or 'downstream', got '{direction}'."
+
+        if np.isinf(max_link_degree):
+            max_link_degree = self.PRACTICAL_MAX_DEGREE + 3
+            print(
+                "WARNING: "
+                "max_link_degree was set to infinity. Coercing to a maximum safe "
+                f"computational depth of {max_link_degree} to prevent network traversal explosions."
             )
-        if degree < 1:
-            raise ValueError(f"degree must be >= 1, got {degree}.")
+        max_link_degree = int(max_link_degree)
+
+        if min_obs_degree < 1:
+            raise ValueError(f"min_obs_degree must be >= 1, got {min_obs_degree}.")
+        if max_link_degree < min_obs_degree:
+            raise ValueError(f"max_link_degree ({max_link_degree}) must be >= min_obs_degree ({min_obs_degree}).")
+
+        # 2. Issue a warning if the limit is computationally dangerous but allow the user to proceed
+        if max_link_degree > self.PRACTICAL_MAX_DEGREE:
+            print(
+                "WARNING: "
+                f"Configured max_link_degree={max_link_degree} exceeds the recommended practical limit "
+                f"of {self.PRACTICAL_MAX_DEGREE}. This may result in exponential graph expansion "
+                "slowdowns and a high risk of total reconstruction failure."
+            )
 
         self.direction: str = direction
-        self.degree: int = degree
-        self.weight = weight if weight is not None else self._base_weight ** degree
+        self.min_obs_degree: int = min_obs_degree
+        self.max_link_degree: int = max_link_degree
+        self.weight = weight #if weight is not None else self._base_weight ** min_obs_degree
+        self.allow_partial_fallback = allow_partial_fallback
 
     @property
     def name(self) -> str:
         """str : Unique source label written to the observation store."""
-        return f"FlowLinkBalancer_{self.direction}_d{self.degree}"
+        return f"FlowLinkBalancer_{self.direction}_d{self.min_obs_degree}-{self.max_link_degree}"
 
     # ------------------------------------------------------------------
     # ReconstructionMethod interface
@@ -126,19 +148,21 @@ class FlowLinkBalancer():
         for section in network.sections.values():
             for period in periods:
                 for vtype in vehicle_types:
-                    volume, volume_err = self._estimate(
+                    volume, volume_err, degree_eff = self._estimate(
                         section=section,
                         direction=self.direction,
-                        degree=self.degree,
+                        min_obs_degree=self.min_obs_degree,
+                        max_link_degree=self.max_link_degree,
                         flow_data=flow_data,
                         period=period,
                         vtype=vtype,
                         visited=frozenset(),
                     )
                     if not np.isnan(volume):
+                        weight = self.weight if self.weight is not None else self._base_weight ** degree_eff
                         rows.append(
                             self._make_row(
-                                section.section_id, period, vtype, volume, volume_err=volume_err
+                                section.section_id, period, vtype, volume, volume_err=volume_err, weight=weight,
                             )
                         )
 
@@ -154,12 +178,14 @@ class FlowLinkBalancer():
         self,
         section: RoadSection,
         direction: str,
-        degree: int,
+        min_obs_degree: int,
+        max_link_degree: int,
         flow_data: FlowStore,
         period: pd.Timestamp,
         vtype: str,
         visited: frozenset,
-    ) -> Tuple[float, float]:
+        numb_obs_skipped: int = 0,
+    ) -> Tuple[float, float, float]:
         """
         Recursively estimate a section's signed volume contribution.
 
@@ -182,68 +208,94 @@ class FlowLinkBalancer():
 
         Returns
         -------
-        tuple of float : volume, volume_err
+        tuple of float : volume, volume_err, effective_degree
             The estimated volume and its error.
             ``np.nan, np.nan`` when the expansion is infeasible 
             (missing data, cycle, or no neighbours to expand from).
         """
-        # Cycle guard
+        # 1. Cycle guard
         if section.section_id in visited:
-            return np.nan, np.nan
+            return np.nan, np.nan, np.nan
+        # 2. Stop traversal if we have fully exhausted our topological max_link_degree depth[cite: 1]
+        if max_link_degree <= 0:
+            return np.nan, np.nan, np.nan
+        next_max_link_degree = max_link_degree - 1
+        
+        # 3. Check if an actual observation exists
+        volume, volume_err = flow_data.section_consensus(
+            section.section_id, period, vtype, source_types=(FlowStore.SOURCE_OBS,)
+        )
+        own_data_available = not np.isnan(volume)
 
-        # Base case: look up the actual data
-        if degree == 0:
-            return flow_data.section_consensus(section.section_id, period, vtype, source_types=(FlowStore.SOURCE_OBS,))
+        def fallback():
+            if own_data_available and self.allow_partial_fallback:
+                return volume, volume_err, numb_obs_skipped + 1
+            return np.nan, np.nan, np.nan
 
-        # Determine which neighbour sets to expand and which direction
-        # the competing branches should recurse into
+        # 4. Decide if further expansion is needed
+        if own_data_available:
+            if min_obs_degree <= 0:
+                # We have bypassed the required number of observations; return this one!
+                return volume, volume_err, numb_obs_skipped + 1
+            else:
+                # An observation exists, but we must bypass it.
+                # Decrement min_obs_degree because we are actively skipping a valid data point.
+                next_min_obs_degree = min_obs_degree - 1
+                next_numb_obs_skipped = numb_obs_skipped + 1
+        else:
+            # No observation exists on this link.
+            # Do NOT decrement min_obs_degree (we didn't bypass any actual data).
+            next_min_obs_degree = min_obs_degree
+            next_numb_obs_skipped = numb_obs_skipped
+
+        # 5. Determine which neighbour sets to expand and in which direction
         if direction == "upstream":
             in_neighbours = section.upstream_in 
             out_neighbours = section.upstream_out
-            if not in_neighbours:  # Do not expand beyond source node
-                return np.nan, np.nan
+            at_network_edge = not in_neighbours  # is this a source node?
         elif direction == "downstream":
             in_neighbours = section.downstream_in
             out_neighbours = section.downstream_out
-            if not out_neighbours:  # Do not expand beyond sink node
-                return np.nan, np.nan
+            at_network_edge = not out_neighbours  # is this sink node?
 
         # If no neighbours exist at this level, expansion is infeasible
-        if not in_neighbours and not out_neighbours:
-            return np.nan, np.nan
+        if at_network_edge:
+            return fallback()
 
         visited = visited | {section.section_id}
 
         total_in = 0.0
         total_out = 0.0
         total_err2 = 0.0
+        degrees_effective = []
 
-        # Positive branches: same sign, same direction
         for s in in_neighbours:
-            v, v_err = self._estimate(
-                s, 'upstream', degree-1,
-                flow_data, period, vtype, visited,
+            v, v_err, d_eff = self._estimate(
+                s, 'upstream', next_min_obs_degree, next_max_link_degree,
+                flow_data, period, vtype, visited, numb_obs_skipped=next_numb_obs_skipped,
             )
             if np.isnan(v):
-                return np.nan, np.nan
+                return fallback()
             total_in += v
             total_err2 += v_err ** 2
+            degrees_effective.append(d_eff)
 
-        # Negative branches: flipped sign, flipped direction
         for s in out_neighbours:
-            v, v_err = self._estimate(
-                s, 'downstream', degree-1,
-                flow_data, period, vtype, visited,
+            v, v_err, d_eff = self._estimate(
+                s, 'downstream', next_min_obs_degree, next_max_link_degree,
+                flow_data, period, vtype, visited, numb_obs_skipped=next_numb_obs_skipped,
             )
             if np.isnan(v):
-                return np.nan, np.nan
+                return fallback()
             total_out += v
             total_err2 += v_err ** 2
+            degrees_effective.append(d_eff)
 
         if direction == 'upstream':
-            return (total_in - total_out), np.sqrt(total_err2)
+            total = total_in - total_out
         elif direction == 'downstream':
-            return (total_out - total_in), np.sqrt(total_err2)
+            total = total_out - total_in
+        return total, np.sqrt(total_err2), np.mean(degrees_effective)
 
     def _make_row( 
         self,
@@ -252,6 +304,7 @@ class FlowLinkBalancer():
         vehicle_type: str,
         volume: float,
         volume_err: float = np.nan,
+        weight: float = np.nan,
     ) -> dict: 
         """
         Build a single reconstruction row dictionary.
@@ -279,7 +332,7 @@ class FlowLinkBalancer():
             "source_id":        self.name,
             "screening":        "NA",
             "validation":       "pending",
-            "weight":           self.weight,
+            "weight":           weight,
         }
 
     def _empty_result(self) -> pd.DataFrame:
@@ -290,5 +343,5 @@ class FlowLinkBalancer():
         return (
             f"FlowBalanceReconstruction("
             f"{self.direction}, "
-            f"degree={self.degree})"
+            f"degree=[{self.min_obs_degree},{self.max_link_degree}])"
         )
