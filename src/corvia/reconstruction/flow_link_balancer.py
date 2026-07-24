@@ -331,7 +331,7 @@ class FlowLinkBalancer():
             "source_type":      FlowStore.SOURCE_REC,
             "source_id":        self.name,
             "screening":        "NA",
-            "validation":       "pending",
+            "validation":       "NA",
             "weight":           weight,
         }
 

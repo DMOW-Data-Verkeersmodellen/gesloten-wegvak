@@ -226,7 +226,16 @@ class FlowResolver:
             print(f"WARNING: FlowResolver reached maximum iterations ({self.max_iterations}) without reaching convergence.")
 
         if resolver_converged:
-            pass
+            lookup_map = self.validator.compute_baseline(store.dataframe.copy())
+            if not lookup_map.empty:
+                resolved_df = (
+                    lookup_map.reset_index()
+                    .rename(columns={"baseline": "volume", "baseline_error": "volume_err"})
+                )
+                resolved_df["source_type"] = FlowStore.SOURCE_RES
+                resolved_df["validation"] = "NA"
+                resolved_df["weight"] = 1.0
+                store.append_estimates(resolved_df)
         
         if self.debug_plot:
             self.plot_iteration_snapshot(iteration,store,periods[0],vehicle_types[0])
