@@ -20,10 +20,35 @@ class BaseValidator(ABC):
     _MAD_ASYMPTOTIC_FACTOR = 1.4826
     
     @abstractmethod
-    def validate(self, store: FlowStore, target_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+    def score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
         """
-        Executes validation on the specified target indices.
-        
+        Computes a normalized severity score for each observation.
+
+        The score is the underlying test statistic divided by the validator's
+        own rejection threshold, so |score| <= 1.0 means "conforming" and
+        |score| > 1.0 means "anomalous", regardless of which statistic or
+        threshold a particular subclass uses internally. This makes severity
+        directly comparable *across* validator types, which greedy/stepwise
+        elimination strategies rely on to rank observations by "how bad" they
+        are rather than just whether they crossed the line.
+
+        NaN indicates no baseline could be established for that observation
+        (e.g. no surviving reconstruction traces at that coordinate) and is
+        therefore neither conforming nor anomalous.
+
+        Returns
+        -------
+        pd.Series
+            Float severity scores aligned to obs_indices.
+        """
+        pass
+
+    def validate(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+        """
+        Executes validation on the specified target indices by thresholding
+        score() at |severity| == 1.0. Subclasses generally shouldn't need to
+        override this — implement score() instead.
+
         Returns
         -------
         conforming_indices : pd.Index
@@ -31,7 +56,10 @@ class BaseValidator(ABC):
         anomalies_indices : pd.Index
             Indices of observations that do not conform (rejected).
         """
-        pass
+        severity = self.score(store, obs_indices)
+        conforming = severity[severity.abs() <= 1.0].index
+        anomalies = severity[severity.abs() > 1.0].index
+        return conforming, anomalies
 
     @staticmethod
     def _calc_weighted_mean_and_std(flow_df: pd.DataFrame) -> pd.Series:
@@ -68,8 +96,8 @@ class ZScoreValidator(BaseValidator):
         self.z_threshold = z_threshold
         self.use_errors = use_errors
 
-    def validate(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
-        df = store.dataframe
+    def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+        df = store.dataframe.copy()
         obs_rows = df.loc[obs_indices]
         
         # 1. Isolate valid active reconstruction traces
@@ -110,10 +138,8 @@ class ZScoreValidator(BaseValidator):
             baseline_err=baseline["std"]
         )
 
-        # 5. Determine validation status
-        anomalies = z_scores[z_scores.abs() > self.z_threshold].index
-        conforming = z_scores[z_scores.abs() <= self.z_threshold].index
-        return conforming, anomalies
+        # 5. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
+        return z_scores / self.z_threshold
 
 
 class ZScoreModifiedValidator(BaseValidator):
@@ -125,8 +151,8 @@ class ZScoreModifiedValidator(BaseValidator):
         self.z_threshold = z_threshold
         self.use_errors = use_errors
 
-    def validate(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
-        df = store.dataframe
+    def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+        df = store.dataframe.copy()
         obs_rows = df.loc[obs_indices]
         
         # 1. Isolate valid active reconstruction traces
@@ -168,10 +194,8 @@ class ZScoreModifiedValidator(BaseValidator):
             baseline_err=baseline["mad"]
         )
 
-        # 5. Determine validation status
-        anomalies = modified_z_scores[modified_z_scores.abs() > self.z_threshold].index
-        conforming = modified_z_scores[modified_z_scores.abs() <= self.z_threshold].index
-        return conforming, anomalies
+        # 5. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
+        return modified_z_scores / self.z_threshold
 
 
 class RelativeErrorValidator(BaseValidator):
@@ -185,7 +209,7 @@ class RelativeErrorValidator(BaseValidator):
         self.use_errors = use_errors
         self._noise_floor = 10.
 
-    def validate(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+    def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
         df = store.dataframe
         obs_rows = df.loc[obs_indices]
         
@@ -217,9 +241,10 @@ class RelativeErrorValidator(BaseValidator):
         diff_abs = (obs_rows["volume"] - baseline).abs()  
         if self.use_errors and "volume_err" in obs_rows.columns:
             safe_err = obs_rows["volume_err"].fillna(0)
-            diff_abs = diff_abs - safe_err
+            diff_abs = (diff_abs - safe_err).clip(lower=0.)
 
-        # 5. Determine validation status
-        anomalies = diff_abs[diff_abs > (baseline*self.limit).clip(lower=self._noise_floor)].index
-        conforming = diff_abs[diff_abs <= (baseline*self.limit).clip(lower=self._noise_floor)].index
-        return conforming, anomalies
+        # 5. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold.
+        # diff_abs is already non-negative, so this ratio is an unsigned severity —
+        # fine for magnitude-based ranking, it just carries no over/under direction.
+        limit_val = (baseline * self.limit).clip(lower=self._noise_floor)
+        return diff_abs / limit_val
