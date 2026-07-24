@@ -22,13 +22,14 @@ class FlowStore():
 
     SOURCE_OBS = "direct_sensor"
     SOURCE_REC = "reconstructed"
+    SOURCE_RES = "resolved"
 
     COLUMNS = ["road_section_id", "timestamp", "vehicle_type", 
                "volume", "volume_err", "source_type", "source_id", 
                "weight", "screening", "validation"]
     
     SCREENING_STATES = {"unknown", "accepted", "disputed", "held", "void", "NA"}
-    VALIDATION_STATES = {"pending", "verified", "unresolved", "rejected"}
+    VALIDATION_STATES = {"pending", "verified", "unresolved", "rejected", "NA"}
 
     def __init__(self) -> None:
         self._df = self._create_empty_matrix()
