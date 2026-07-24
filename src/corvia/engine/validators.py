@@ -62,12 +62,14 @@ class BaseValidator(ABC):
         return conforming, anomalies
 
     @staticmethod
-    def _calc_weighted_mean_and_std(flow_df: pd.DataFrame) -> pd.Series:
+    def _calc_weighted_mean_and_std(flow_df: pd.DataFrame, median_mixing_fraction: float = 0.) -> pd.Series:
         v = flow_df["volume"].to_numpy(dtype="float64")
         e = flow_df["volume_err"].to_numpy(dtype="float64")
         w = flow_df["weight"].to_numpy(dtype="float64")
         mean, std = utils.weighted_mean_and_error(v, e, w)
-        return pd.Series({"baseline": mean, "baseline_error": std})
+        median = np.median(v)
+        baseline = mean*(1.-median_mixing_fraction) + median*median_mixing_fraction
+        return pd.Series({"baseline": baseline, "baseline_error": std})
     
     @staticmethod
     def _calc_median_and_mad(flow_df: pd.DataFrame, poisson_floor_factor: float = 1.0) -> pd.Series:
@@ -92,9 +94,12 @@ class ZScoreValidator(BaseValidator):
     """
     Standard Z-Score validation comparing observations to a weighted baseline mean.
     """
-    def __init__(self, z_threshold: float = 1.96, use_errors: bool = True):
+    def __init__(self, z_threshold: float = 1.96, use_errors: bool = True, median_mixing_fraction: float = 0.):
         self.z_threshold = z_threshold
         self.use_errors = use_errors
+        if not (0. <= median_mixing_fraction < 1. ):
+            raise ValueError("Median mixing fraction should be a value of the interval (0,1]")
+        self.median_mixing_fraction = median_mixing_fraction
 
     def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
         df = store.dataframe.copy()
@@ -111,7 +116,7 @@ class ZScoreValidator(BaseValidator):
         # 2. Compute baseline EXACTLY ONCE per unique spatial-temporal coordinate
         lookup_map = (
             recon_rows.groupby(["road_section_id", "timestamp", "vehicle_type"], observed=True)
-            .apply(self._calc_weighted_mean_and_std, include_groups=False)
+            .apply(self._calc_weighted_mean_and_std, include_groups=False, median_mixing_fraction=self.median_mixing_fraction)
         )
 
         # 3. Broadcast the unique baselines out to the investigated indices
@@ -121,7 +126,7 @@ class ZScoreValidator(BaseValidator):
             on=["road_section_id", "timestamp", "vehicle_type"], 
             how="left"
         ).set_index('index')[["baseline", "baseline_error"]]
-        baseline = baseline.rename(columns={"baseline": "mean", "baseline_error": "std"})
+        #baseline = baseline.rename(columns={"baseline": "mean", "baseline_error": "std"})
         
         # 4. Calculate Z Scores
         if self.use_errors and "volume_err" in obs_rows.columns:
@@ -134,8 +139,8 @@ class ZScoreValidator(BaseValidator):
         z_scores = utils.compute_z_score(
             observed_val=obs_rows["volume"],
             observed_err=obs_err,
-            baseline_val=baseline["mean"],
-            baseline_err=baseline["std"]
+            baseline_val=baseline["baseline"],
+            baseline_err=baseline["baseline_error"]
         )
 
         # 5. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
