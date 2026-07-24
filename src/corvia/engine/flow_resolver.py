@@ -6,6 +6,7 @@ from typing import List, Tuple, Optional, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 
 from corvia.network_states.flow import FlowStore
 from corvia.utils import compute_z_score, weighted_mean_and_error
@@ -354,19 +355,19 @@ class FlowResolver:
                 ax1.errorbar(x_loc, row["volume"], yerr=row["volume_err"], fmt=fmt,
                     color=colour, capsize=4, elinewidth=2, zorder=5, label=label_str)
                     
-            ax1.set_ylabel("Flow Volume (Veh/hr)", fontsize=11)
+            ax1.set_ylabel("Flow Volume (Veh/Period)", fontsize=11)
             ax1.set_title(f"Pass {iteration}", fontweight="bold")
             
             # --- ROW 2: RESIDUAL DELTAS ---
-            ax2.grid(True, linestyle="--", alpha=0.4)
+            #ax2.grid(True, linestyle="--", alpha=0.4)
             ax2.axhline(0, color="#1f77b4", linestyle="-", alpha=0.3)
             
             for _, row in obs.iterrows():
                 x_loc = sec_to_x[row["road_section_id"]]
                 base_m = reco_means[x_loc]
                 base_std = reco_stds[x_loc]
-                delta = row["volume"] - base_m if not pd.isna(base_m) else np.nan
-                delta_std = np.sqrt(row["volume_err"]**2 + base_std**2) if not pd.isna(base_std) else np.nan
+                delta = (row["volume"] - base_m) * 100/abs(base_m) if not pd.isna(base_m) else np.nan
+                delta_std = np.sqrt(row["volume_err"]**2 + base_std**2) * 100/abs(base_m) if not pd.isna(base_std) else np.nan
 
                 if row["validation"] == "rejected":
                     colour = "#d62728"  # Red
@@ -389,9 +390,16 @@ class FlowResolver:
                     ax2.vlines(x_loc, 0, delta, colors=colour, alpha=0.4, linewidth=1, ls=':')
                     ax2.errorbar(x_loc, delta, yerr=delta_std, color=colour, fmt=fmt, elinewidth=2, capsize=5, zorder=3)
                     
-            ax2.set_ylabel("Residual Delta (Veh/h)", fontsize=11)
+            ax2.set_ylabel("Residual Delta (%)", fontsize=11)
             ax2.set_xticks(x_positions)
             ax2.set_xticklabels(chunk_section_ids, rotation=45, ha="right")
+            ax2.set_yscale('symlog', linthresh=3, linscale=1.5)
+            ax2.axhspan(-2,2, color="#BBBBBB", alpha=0.2, zorder=0, label="Acceptance band (2%)")
+            ax2.axhspan(-.5,.5, color="#BBBBBB", alpha=0.2, zorder=1, label="Acceptance band (0.5%)")
+            ax2.set_ylim((-100,100))
+            ax2.yaxis.set_major_locator(ticker.SymmetricalLogLocator(base=10, linthresh=3))
+            ax2.yaxis.set_minor_locator(ticker.SymmetricalLogLocator(base=10, linthresh=3, subs=np.arange(2, 9)))
+            ax2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda val, pos: f"{int(val)}%"))
             
             # --- BUILD SINGLE ROW LEGEND UNDER THE AXES ---
             # Harvest handles from the top plotting layer and remove duplicates
@@ -558,7 +566,7 @@ class FlowResolver:
                             color=colour, capsize=4, elinewidth=2, zorder=5, label=label_str)
                     
                     if col_idx == 0:
-                        ax_vol.set_ylabel("Flow Volume (Veh/hr)", fontsize=11)
+                        ax_vol.set_ylabel("Flow Volume (Veh/Period)", fontsize=11)
                     
                     # Accumulate handles from this axis to generate a clean unified legend layout later
                     h, l = ax_vol.get_legend_handles_labels()
@@ -573,8 +581,8 @@ class FlowResolver:
                         x_loc = sec_to_x[row["road_section_id"]]
                         base_m = reco_means[x_loc]
                         base_std = reco_stds[x_loc]
-                        delta = row["volume"] - base_m if not pd.isna(base_m) else np.nan
-                        delta_std = np.sqrt(row["volume_err"]**2 + base_std**2) if not pd.isna(base_std) else np.nan
+                        delta = (row["volume"] - base_m) * 100/abs(base_m) if not pd.isna(base_m) else np.nan
+                        delta_std = np.sqrt(row["volume_err"]**2 + base_std**2) * 100/abs(base_m) if not pd.isna(base_std) else np.nan
                         
                         if row["validation"] == "rejected":
                             colour = "#d62728"  # Red
@@ -598,10 +606,16 @@ class FlowResolver:
                             ax_res.errorbar(x_loc, delta, yerr=delta_std, color=colour, fmt=fmt, elinewidth=2, capsize=5, zorder=3)
                     
                     if col_idx == 0:
-                        ax_res.set_ylabel("Residual Delta (Veh/h)", fontsize=11)
+                        ax_res.set_ylabel("Residual Delta (%)", fontsize=11)
                         
                     ax_res.set_xticks(x_positions)
                     ax_res.set_xticklabels(chunk_section_ids, rotation=45, ha="right")
+                    ax_res.set_yscale('symlog', linthresh=3)
+                    ax_res.axhspan(-2,2, color="#BBBBBB", alpha=0.2, zorder=0, label="Acceptance band (2%)")
+                    ax_res.axhspan(-.5,.5, color="#BBBBBB", alpha=0.2, zorder=1, label="Acceptance band (0.5%)")
+                    ax_res.set_ylim((-100,100))
+                    ax_res.yaxis.set_major_locator(ticker.SymmetricalLogLocator(base=10, linthresh=3))
+                    ax_res.yaxis.set_minor_locator(ticker.SymmetricalLogLocator(base=10, linthresh=3, subs=np.arange(2, 10)))
 
                 # --- RENDER UNIQUE EXTERNAL LEGEND ON THE RIGHT-MOST AXIS ---
                 # Use dictionary conversion to filter out duplicate names cleanly
