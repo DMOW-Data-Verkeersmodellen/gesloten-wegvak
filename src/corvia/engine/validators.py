@@ -43,6 +43,69 @@ class BaseValidator(ABC):
         """
         pass
 
+    @abstractmethod
+    def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
+        """
+        Reduces the surviving reconstruction rows at ONE
+        (road_section_id, timestamp, vehicle_type) coordinate to this
+        validator's own ("baseline", "baseline_error") pair.
+        """
+        pass
+
+    def compute_baseline(self, flow_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Computes this validator's baseline EXACTLY ONCE per unique
+        (road_section_id, timestamp, vehicle_type) coordinate, from the
+        currently-surviving reconstruction traces in `flow_df`. This is 
+        the single source of truth for "what does this validator consider 
+        the consensus to be".
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns ["baseline", "baseline_error"], indexed by
+            (road_section_id, timestamp, vehicle_type). Empty (but with the
+            right columns) if no valid reconstruction traces exist anywhere
+            in `flow_df`.
+        """
+        # 1. Isolate valid active reconstruction traces
+        recon_mask = (flow_df["source_type"] == FlowStore.SOURCE_REC) & (flow_df["validation"] != "rejected")
+        recon_rows = flow_df[recon_mask].dropna(subset=["volume"])
+
+        if recon_rows.empty:
+            return pd.DataFrame(columns=["baseline", "baseline_error"])
+
+        # 2. Compute baseline EXACTLY ONCE per unique spatial-temporal coordinate
+        return (
+            recon_rows.groupby(["road_section_id", "timestamp", "vehicle_type"], observed=True)
+            .apply(self._aggregate_group, include_groups=False)
+        )
+    
+    @staticmethod
+    def _broadcast_baseline(lookup_map: pd.DataFrame, target_rows: pd.DataFrame) -> pd.DataFrame:
+        """
+        Aligns a per-coordinate baseline table (as returned by
+        `compute_baseline`) onto arbitrary target rows — the merge-by-
+        coordinate step every subclass's score() previously duplicated.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns ["baseline", "baseline_error"], aligned to
+            target_rows.index. NaN where no baseline exists for that row's
+            coordinate (e.g. no surviving reconstruction there).
+        """
+        if lookup_map.empty:
+            return pd.DataFrame(np.nan, index=target_rows.index, columns=["baseline", "baseline_error"])
+
+        obs_coords = target_rows[["road_section_id", "timestamp", "vehicle_type"]].reset_index()
+        baseline = obs_coords.merge(
+            lookup_map, 
+            on=["road_section_id", "timestamp", "vehicle_type"], 
+            how="left"
+        ).set_index("index")[["baseline", "baseline_error"]]
+        return baseline
+
     def validate(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
         """
         Executes validation on the specified target indices by thresholding
@@ -97,38 +160,21 @@ class ZScoreValidator(BaseValidator):
     def __init__(self, z_threshold: float = 1.96, use_errors: bool = True, median_mixing_fraction: float = 0.):
         self.z_threshold = z_threshold
         self.use_errors = use_errors
-        if not (0. <= median_mixing_fraction < 1. ):
-            raise ValueError("Median mixing fraction should be a value of the interval (0,1]")
+        if not (0. <= median_mixing_fraction <= 1. ):
+            raise ValueError("Median mixing fraction should be a value of the interval [0,1]")
         self.median_mixing_fraction = median_mixing_fraction
 
     def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
         df = store.dataframe.copy()
         obs_rows = df.loc[obs_indices]
         
-        # 1. Isolate valid active reconstruction traces
-        recon_mask = (df["source_type"] == FlowStore.SOURCE_REC) & (df["validation"] != "rejected")
-        recon_rows = df[recon_mask].dropna(subset=["volume"])
+        # A. Compute baselines
+        lookup_map = self.compute_baseline(df)
+        if lookup_map.empty:
+            return pd.Series(np.nan, index=obs_indices, dtype="float32")
+        baseline = self._broadcast_baseline(lookup_map, obs_rows)
         
-        if recon_rows.empty:
-            empty_series = pd.Series(np.nan, index=obs_indices, dtype="float32")
-            return empty_series, empty_series
-
-        # 2. Compute baseline EXACTLY ONCE per unique spatial-temporal coordinate
-        lookup_map = (
-            recon_rows.groupby(["road_section_id", "timestamp", "vehicle_type"], observed=True)
-            .apply(self._calc_weighted_mean_and_std, include_groups=False, median_mixing_fraction=self.median_mixing_fraction)
-        )
-
-        # 3. Broadcast the unique baselines out to the investigated indices
-        obs_coords = obs_rows[["road_section_id", "timestamp", "vehicle_type"]].reset_index()
-        baseline = obs_coords.merge(
-            lookup_map, 
-            on=["road_section_id", "timestamp", "vehicle_type"], 
-            how="left"
-        ).set_index('index')[["baseline", "baseline_error"]]
-        #baseline = baseline.rename(columns={"baseline": "mean", "baseline_error": "std"})
-        
-        # 4. Calculate Z Scores
+        # B. Calculate Z Scores
         if self.use_errors and "volume_err" in obs_rows.columns:
             # Mathematical variant that integrates observation-level uncertainties
             obs_err = obs_rows["volume_err"]
@@ -143,48 +189,33 @@ class ZScoreValidator(BaseValidator):
             baseline_err=baseline["baseline_error"]
         )
 
-        # 5. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
+        # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
         return z_scores / self.z_threshold
 
+    def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
+        return self._calc_weighted_mean_and_std(group, median_mixing_fraction=self.median_mixing_fraction)
 
 class ZScoreModifiedValidator(BaseValidator):
     """
     Modified Z-Score validation using Median and Median Absolute Deviation (MAD).
     """
-    def __init__(self, z_threshold: float = 3.5, use_errors: bool = True):
+    def __init__(self, z_threshold: float = 3.5, use_errors: bool = True, poisson_floor_factor: float = 1.):
         # 3.5 is the standard recommended threshold for modified Z-score outliers
         self.z_threshold = z_threshold
         self.use_errors = use_errors
+        self.poisson_floor_factor = poisson_floor_factor
 
     def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
         df = store.dataframe.copy()
         obs_rows = df.loc[obs_indices]
         
-        # 1. Isolate valid active reconstruction traces
-        recon_mask = (df["source_type"] == FlowStore.SOURCE_REC) & (df["validation"] != "rejected")
-        recon_rows = df[recon_mask].dropna(subset=["volume"])
+        # A. Compute baselines
+        lookup_map = self.compute_baseline(df)
+        if lookup_map.empty:
+            return pd.Series(np.nan, index=obs_indices, dtype="float32")
+        baseline = self._broadcast_baseline(lookup_map, obs_rows)
         
-        if recon_rows.empty:
-            empty_series = pd.Series(np.nan, index=obs_indices, dtype="float32")
-            return empty_series, empty_series
-
-        # 2. Compute baseline EXACTLY ONCE per unique spatial-temporal coordinate
-        lookup_map = (
-            recon_rows.groupby(["road_section_id", "timestamp", "vehicle_type"], observed=True)
-            .apply(self._calc_median_and_mad, include_groups=False)
-        )
-
-        # 3. Broadcast the unique baselines out to the investigated indices
-        obs_coords = obs_rows[["road_section_id", "timestamp", "vehicle_type"]].reset_index()
-        baseline = obs_coords.merge(
-            lookup_map, 
-            on=["road_section_id", "timestamp", "vehicle_type"], 
-            how="left"
-        ).set_index('index')[["baseline", "baseline_error"]]
-        baseline = baseline.rename(columns={"baseline": "median", "baseline_error": "mad"})
-        
-
-        # 4. Calculate Modified Z Scores
+        # B. Calculate Z Scores
         if self.use_errors and "volume_err" in obs_rows.columns:
             # Mathematical variant that integrates observation-level uncertainties
             obs_err = obs_rows["volume_err"]
@@ -195,12 +226,15 @@ class ZScoreModifiedValidator(BaseValidator):
         modified_z_scores = 0.6745 * utils.compute_z_score(
             observed_val=obs_rows["volume"],
             observed_err=obs_err,
-            baseline_val=baseline["median"],
-            baseline_err=baseline["mad"]
+            baseline_val=baseline["baseline"],
+            baseline_err=baseline["baseline_error"]
         )
 
-        # 5. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
+        # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
         return modified_z_scores / self.z_threshold
+    
+    def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
+        return self._calc_median_and_mad(group, poisson_floor_factor=self.poisson_floor_factor)
 
 
 class RelativeErrorValidator(BaseValidator):
@@ -218,38 +252,23 @@ class RelativeErrorValidator(BaseValidator):
         df = store.dataframe
         obs_rows = df.loc[obs_indices]
         
-        # --- Computing mean baseline --- 
-        # 1. Isolate valid active reconstruction traces
-        recon_mask = (df["source_type"] == FlowStore.SOURCE_REC) & (df["validation"] != "rejected")
-        recon_rows = df[recon_mask].dropna(subset=["volume"])
+        # A. Compute baselines
+        lookup_map = self.compute_baseline(df)
+        if lookup_map.empty:
+            return pd.Series(np.nan, index=obs_indices, dtype="float32")
+        baseline = self._broadcast_baseline(lookup_map, obs_rows)
         
-        if recon_rows.empty:
-            empty_series = pd.Series(np.nan, index=obs_indices, dtype="float32")
-            return empty_series, empty_series
-
-        # 2. Compute baseline EXACTLY ONCE per unique spatial-temporal coordinate
-        lookup_map = (
-            recon_rows.groupby(["road_section_id", "timestamp", "vehicle_type"], observed=True)
-            .apply(self._calc_median_and_mad if self.use_median else self._calc_weighted_mean_and_std, include_groups=False)
-        )
-
-        # 3. Broadcast the unique baselines out to the investigated indices
-        obs_coords = obs_rows[["road_section_id", "timestamp", "vehicle_type"]].reset_index()
-        baseline = obs_coords.merge(
-            lookup_map, 
-            on=["road_section_id", "timestamp", "vehicle_type"], 
-            how="left"
-        ).set_index('index')["baseline"]
-        
-
-        # 4. Check relative differences
+        # B. Check relative differences
         diff_abs = (obs_rows["volume"] - baseline).abs()  
         if self.use_errors and "volume_err" in obs_rows.columns:
             safe_err = obs_rows["volume_err"].fillna(0)
             diff_abs = (diff_abs - safe_err).clip(lower=0.)
 
-        # 5. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold.
+        # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold.
         # diff_abs is already non-negative, so this ratio is an unsigned severity —
         # fine for magnitude-based ranking, it just carries no over/under direction.
         limit_val = (baseline * self.limit).clip(lower=self._noise_floor)
         return diff_abs / limit_val
+    
+    def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
+        return self._calc_median_and_mad(group) if self.use_median else self._calc_weighted_mean_and_std(group)
