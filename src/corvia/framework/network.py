@@ -54,6 +54,8 @@ class Network:
         Point geometries for all nodes.  Index must be ``node_id``.
     links_gdf : geopandas.GeoDataFrame
         Linestring geometries for all links.  Index must be ``link_id``.
+    sensors_gdf : geopandas.GeoDataFrame
+        Point geometries for all sensors.  Index must be ``location_id``.
 
     Attributes
     ----------
@@ -63,6 +65,7 @@ class Network:
     _sections : dict of {str: RoadSection}
     _nodes_gdf : geopandas.GeoDataFrame
     _links_gdf : geopandas.GeoDataFrame
+    _sensors_gdf : geopandas.GeoDataFrame
     _layers : dict of {str: geopandas.GeoDataFrame}
         Extra spatial layers (zones, connectors, …).
 
@@ -89,12 +92,14 @@ class Network:
         sections: Dict[str, RoadSection],
         nodes_gdf: gpd.GeoDataFrame,
         links_gdf: gpd.GeoDataFrame,
+        sensors_gdf: gpd.GeoDataFrame,
     ) -> None:
         self._nodes: Dict[str, Node] = dict(nodes)
         self._links: Dict[str, Link] = dict(links)
         self._sections: Dict[str, RoadSection] = dict(sections)
         self._nodes_gdf: gpd.GeoDataFrame = nodes_gdf
         self._links_gdf: gpd.GeoDataFrame = links_gdf
+        self._sensors_gdf: gpd.GeoDataFrame = sensors_gdf
         self._layers: Dict[str, gpd.GeoDataFrame] = {}
         self._name: str = name
     # ------------------------------------------------------------------
@@ -139,6 +144,16 @@ class Network:
         ``LineString`` objects (or ``None`` where absent).
         """
         return self._links_gdf
+
+    @property
+    def sensors_gdf(self) -> gpd.GeoDataFrame:
+        """
+        geopandas.GeoDataFrame : Sensor geometries.
+
+        Index is ``location_id``.  Geometry column contains Shapely
+        ``Point`` objects (or ``None`` where absent).
+        """
+        return self._sensors_gdf
 
     # ------------------------------------------------------------------
     # Counts
@@ -244,6 +259,23 @@ class Network:
             return None
         geom = self._links_gdf.loc[link_id, "geometry"]
         return None if pd.isna(geom) else geom
+
+    def sensor_geometry(self, location_id: str) -> Optional[BaseGeometry]:
+            """
+            Return the Shapely geometry for a link.
+    
+            Parameters
+            ----------
+            link_id : str
+    
+            Returns
+            -------
+            shapely.geometry.base.BaseGeometry or None
+            """
+            if location_id not in self._sensors_gdf.index:
+                return None
+            geom = self._sensors_gdf.loc[location_id, "geometry"]
+            return None if pd.isna(geom) else geom
 
     # ------------------------------------------------------------------
     # Extra spatial layers (zones, connectors, …)

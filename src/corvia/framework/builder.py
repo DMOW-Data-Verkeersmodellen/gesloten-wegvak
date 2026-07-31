@@ -279,7 +279,7 @@ class NetworkBuilder:
     # Step 2 — section compilation
     # ------------------------------------------------------------------
 
-    def compile_road_sections(self) -> None:
+    def compile_road_sections(self, section_id_fn: Optional[Callable[[List[Link]], str]] = None) -> None:
         """
         Merge consecutive pass-through links into :class:`~topology.RoadSection`
         objects, then wire direct neighbour references between sections.
@@ -288,6 +288,26 @@ class NetworkBuilder:
         The algorithm seeds from each unvisited link, then traces forward and
         backward through pass-through nodes until hitting a junction, source,
         or sink.
+
+        Parameters
+        ----------
+        section_id_fn : callable, optional
+            Given the ordered list of links in a chain, return the
+            ``section_id`` to assign to it. Defaults to ``None``, which
+            keeps the built-in ``SECTION_0001``, ``SECTION_0002``, …
+            numbering. Called once per chain, so the returned id only
+            needs to be unique *within that call* — e.g. using the
+            chain's first ``link_id`` is always safe, since every link
+            belongs to exactly one chain.
+
+        Examples
+        --------
+        Key sections by their first link's id instead of the default
+        numbering::
+
+            builder.compile_road_sections(
+                section_id_fn=lambda chain: chain[0].link_id
+            )
         """
         if not self._session_open:
             raise RuntimeError(
@@ -332,7 +352,7 @@ class NetworkBuilder:
                 visited.add(prev_link.link_id)
                 current = prev_link
 
-            sec_id = f"SECTION_{section_counter:04d}"
+            sec_id = section_id_fn(chain) if section_id_fn else f"SECTION_{section_counter:04d}"
             self._sections[sec_id] = RoadSection(sec_id, chain)
             section_counter += 1
 
@@ -483,6 +503,7 @@ class NetworkBuilder:
         nodes_data: List[dict],
         counts_data: List[dict],
         crs: str = "EPSG:3812",
+        section_id_fn: Optional[Callable[[List[Link]], str]] = None,
     ) -> Network:
         """
         Run all three build steps and return a :class:`~network.Network`.
@@ -491,7 +512,7 @@ class NetworkBuilder:
 
             builder = NetworkBuilder()
             builder.build_raw_network(links_data, nodes_data, counts_data)
-            builder.compile_road_sections()
+            builder.compile_road_sections(section_id_fn=section_id_fn)
             return builder.build(crs=crs)
 
         Parameters
@@ -503,6 +524,8 @@ class NetworkBuilder:
         counts_data : list of dict
         crs : str, optional
             Coordinate reference system.  Defaults to ``"EPSG:3812"``.
+        section_id_fn : callable, optional
+            Forwarded to :meth:`compile_road_sections`.
 
         Returns
         -------
@@ -511,7 +534,7 @@ class NetworkBuilder:
         builder = cls()
         builder.begin(name_network=name_network, crs=crs)
         builder.build_raw_network(links_data, nodes_data, counts_data)
-        builder.compile_road_sections()
+        builder.compile_road_sections(section_id_fn=section_id_fn)
         return builder.end()
 
     # ------------------------------------------------------------------
