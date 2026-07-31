@@ -30,8 +30,8 @@ Expected record shapes
 nodes_data  : list of dict — ``node_id`` (str), ``geometry`` (WKT str or shapely geometry, opt.)
 links_data  : list of dict — ``link_id``, ``start_node``, ``end_node``,
               ``geometry`` (WKT str or shapely geometry, opt.)
-counts_data : list of dict — ``location_id``, ``link_id``,
-              ``name`` (str, opt.), ``lane_count`` (int, opt.)
+counts_data : list of dict — ``location_id``, ``link_id``, ``name`` (str, opt.), 
+              ``lane_count`` (int, opt.), ``geometry`` (WKT str or shapely geometry, opt.)
 """
 
 from __future__ import annotations
@@ -70,6 +70,9 @@ class NetworkBuilder:
     _link_geometries : dict of {str: str, shapely geometry, or None}
         Link geometry (WKT string or already-built shapely geometry),
         consumed by :meth:`build`.
+    _sensor_geometries : dict of {str: str, shapely geometry, or None}
+        Sensor geometry (WKT string or already-built shapely geometry),
+        consumed by :meth:`build`.
 
     Examples
     --------
@@ -92,9 +95,11 @@ class NetworkBuilder:
     def __init__(self) -> None:
         self._nodes: Dict[str, Node] = {}
         self._links: Dict[str, Link] = {}
+        self._sensors: Dict[str, SensorLocation] = {}
         self._sections: Dict[str, RoadSection] = {}
         self._node_geometries: Dict[str, Optional[Union[str, BaseGeometry]]] = {}
         self._link_geometries: Dict[str, Optional[Union[str, BaseGeometry]]] = {}
+        self._sensor_geometries: Dict[str, Optional[Union[str, BaseGeometry]]] = {}
         self._crs: Optional[str] = None
         self._name_network: Optional[str] = None
         self._session_open: bool = False
@@ -108,6 +113,11 @@ class NetworkBuilder:
     def link_count(self) -> int:
         """int : Links registered in the current session."""
         return len(self._links)
+
+    @property
+    def sensor_count(self) -> int:
+        """int : Sensors registered in the current session."""
+        return len(self._sensors)
  
     @property
     def name_network(self) -> str:
@@ -214,7 +224,8 @@ class NetworkBuilder:
             ``geometry`` (WKT str or shapely geometry) is optional.
         counts_data : list of dict
             Each dict must contain ``location_id`` (str) and ``link_id``
-            (str).  ``name`` (str) and ``lane_count`` (int) are optional.
+            (str).  ``name`` (str), ``lane_count`` (int) and
+            ``geometry`` (WKT str or shapely geometry) are optional
 
         Notes
         -----
@@ -261,6 +272,8 @@ class NetworkBuilder:
                 lane_count=c.get("lane_count", 0),
             )
             self._links[link_id].attach_sensor(loc)
+            self._sensors[c["location_id"]] = loc
+            self._sensor_geometries[c["location_id"]] = c.get("geometry")
 
     # ------------------------------------------------------------------
     # Step 2 — section compilation
@@ -358,6 +371,7 @@ class NetworkBuilder:
             sections=self._sections,
             nodes_gdf=self._build_nodes_gdf(self._crs),
             links_gdf=self._build_links_gdf(self._crs),
+            sensors_gdf=self._build_sensors_gdf(self._crs)
         )
 
     # ------------------------------------------------------------------
@@ -409,6 +423,29 @@ class NetworkBuilder:
             index=pd.Index(ids, name="link_id"),
             crs=crs,
         )
+
+    def _build_sensors_gdf(self, crs: str) -> gpd.GeoDataFrame:
+            """
+            Build the links GeoDataFrame from stored WKT geometry strings.
+    
+            Parameters
+            ----------
+            crs : str
+    
+            Returns
+            -------
+            geopandas.GeoDataFrame
+                Index: ``link_id``.  Columns: ``geometry``.
+            """
+            ids = list(self._sensors.keys())
+            geometries = [
+                self._parse_geometry(self._sensor_geometries.get(cid)) for cid in ids
+            ]
+            return gpd.GeoDataFrame(
+                {"geometry": geometries},
+                index=pd.Index(ids, name="location_id"),
+                crs=crs,
+            )
 
     @staticmethod
     def _parse_geometry(geom: Optional[Union[str, BaseGeometry]]) -> Optional[BaseGeometry]:
@@ -492,9 +529,11 @@ class NetworkBuilder:
         """
         self._nodes.clear()
         self._links.clear()
+        self._sensors.clear()
         self._sections.clear()
         self._node_geometries.clear()
         self._link_geometries.clear()
+        self._sensor_geometries.clear()
         self._crs = None
         self._name_network = None
         self._session_open = False
