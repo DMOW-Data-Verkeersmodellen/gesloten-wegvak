@@ -27,9 +27,9 @@ three steps in one call.
 
 Expected record shapes
 ----------------------
-nodes_data  : list of dict — ``node_id`` (str), ``geometry`` (WKT str, opt.)
+nodes_data  : list of dict — ``node_id`` (str), ``geometry`` (WKT str or shapely geometry, opt.)
 links_data  : list of dict — ``link_id``, ``start_node``, ``end_node``,
-              ``geometry`` (WKT str, opt.)
+              ``geometry`` (WKT str or shapely geometry, opt.)
 counts_data : list of dict — ``location_id``, ``link_id``,
               ``name`` (str, opt.), ``lane_count`` (int, opt.)
 """
@@ -37,7 +37,7 @@ counts_data : list of dict — ``location_id``, ``link_id``,
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import geopandas as gpd
 import pandas as pd
@@ -64,10 +64,12 @@ class NetworkBuilder:
         Link registry built during :meth:`build_raw_network`.
     _sections : dict of {str: RoadSection}
         Section registry built during :meth:`compile_road_sections`.
-    _node_geometries : dict of {str: str or None}
-        WKT geometry strings for nodes, consumed by :meth:`build`.
-    _link_geometries : dict of {str: str or None}
-        WKT geometry strings for links, consumed by :meth:`build`.
+    _node_geometries : dict of {str: str, shapely geometry, or None}
+        Node geometry (WKT string or already-built shapely geometry),
+        consumed by :meth:`build`.
+    _link_geometries : dict of {str: str, shapely geometry, or None}
+        Link geometry (WKT string or already-built shapely geometry),
+        consumed by :meth:`build`.
 
     Examples
     --------
@@ -91,8 +93,8 @@ class NetworkBuilder:
         self._nodes: Dict[str, Node] = {}
         self._links: Dict[str, Link] = {}
         self._sections: Dict[str, RoadSection] = {}
-        self._node_geometries: Dict[str, Optional[str]] = {}
-        self._link_geometries: Dict[str, Optional[str]] = {}
+        self._node_geometries: Dict[str, Optional[Union[str, BaseGeometry]]] = {}
+        self._link_geometries: Dict[str, Optional[Union[str, BaseGeometry]]] = {}
         self._crs: Optional[str] = None
         self._name_network: Optional[str] = None
         self._session_open: bool = False
@@ -206,10 +208,10 @@ class NetworkBuilder:
         ----------
         links_data : list of dict
             Each dict must contain ``link_id`` (str), ``start_node`` (str),
-            ``end_node`` (str).  ``geometry`` (WKT str) is optional.
+            ``end_node`` (str).  ``geometry`` (WKT str or shapely geometry) is optional.
         nodes_data : list of dict
             Each dict must contain ``node_id`` (str).
-            ``geometry`` (WKT str) is optional.
+            ``geometry`` (WKT str or shapely geometry) is optional.
         counts_data : list of dict
             Each dict must contain ``location_id`` (str) and ``link_id``
             (str).  ``name`` (str) and ``lane_count`` (int) are optional.
@@ -349,16 +351,13 @@ class NetworkBuilder:
                 "Nothing to build. Call build_raw_network() first."
             )
 
-        nodes_gdf = self._build_nodes_gdf(self._crs)
-        links_gdf = self._build_links_gdf(self._crs)
-
         return Network(
             name=self._name_network,
             nodes=self._nodes,
             links=self._links,
             sections=self._sections,
-            nodes_gdf=nodes_gdf,
-            links_gdf=links_gdf,
+            nodes_gdf=self._build_nodes_gdf(self._crs),
+            links_gdf=self._build_links_gdf(self._crs),
         )
 
     # ------------------------------------------------------------------
@@ -380,7 +379,7 @@ class NetworkBuilder:
         """
         ids = list(self._nodes.keys())
         geometries = [
-            self._parse_wkt(self._node_geometries.get(nid)) for nid in ids
+            self._parse_geometry(self._node_geometries.get(nid)) for nid in ids
         ]
         return gpd.GeoDataFrame(
             {"geometry": geometries},
@@ -403,7 +402,7 @@ class NetworkBuilder:
         """
         ids = list(self._links.keys())
         geometries = [
-            self._parse_wkt(self._link_geometries.get(lid)) for lid in ids
+            self._parse_geometry(self._link_geometries.get(lid)) for lid in ids
         ]
         return gpd.GeoDataFrame(
             {"geometry": geometries},
@@ -412,23 +411,26 @@ class NetworkBuilder:
         )
 
     @staticmethod
-    def _parse_wkt(geom_str: Optional[str]) -> Optional[BaseGeometry]:
+    def _parse_geometry(geom: Optional[Union[str, BaseGeometry]]) -> Optional[BaseGeometry]:
         """
-        Parse a WKT string into a Shapely geometry.
+        Resolve a stored geometry value into a Shapely geometry.
 
         Parameters
         ----------
-        geom_str : str or None
+        geom : str, shapely.geometry.base.BaseGeometry, or None
+            Either a WKT string (parsed via ``shapely.wkt.loads``) or an
+            already-built Shapely geometry, returned unchanged.
 
         Returns
         -------
         shapely.geometry.base.BaseGeometry or None
-            ``None`` when *geom_str* is falsy or cannot be parsed.
+            ``None`` when *geom* is ``None``/falsy or a WKT string 
+            that fails to parse.
         """
-        if not geom_str:
-            return None
+        if isinstance(geom, BaseGeometry) or geom is None:
+            return geom
         try:
-            return shapely_wkt.loads(geom_str)
+            return shapely_wkt.loads(geom)
         except Exception:
             return None
 
