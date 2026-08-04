@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
 from corvia.network_states.flow import FlowStore
-from corvia.utils import compute_z_score, weighted_mean_and_error
+from corvia.utils import weighted_mean_and_error
 
 if TYPE_CHECKING:
     from corvia.framework.network import Network
@@ -116,7 +116,7 @@ class FlowResolver:
             store.set_validation_state(obs_rows.index, "pending")       
             
             # 5. Execute validation and classification choices
-            severity = self.validator.score(store, obs_rows.index)
+            severity = self.validator.severity_score(store, obs_rows.index)
             conforming_indices = severity[severity.abs() <= 1.0].index
             anomalies_indices = severity[severity.abs() > 1.0].index
 

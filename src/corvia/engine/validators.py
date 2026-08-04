@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Tuple, TYPE_CHECKING
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from corvia import utils
 from corvia.network_states.flow import FlowStore
@@ -18,19 +19,19 @@ class BaseValidator(ABC):
         6: 1.140, 7: 1.129, 8: 1.107, 9: 1.093,
     }
     _MAD_ASYMPTOTIC_FACTOR = 1.4826
-    
-    @abstractmethod
-    def score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
-        """
-        Computes a normalized severity score for each observation.
 
-        The score is the underlying test statistic divided by the validator's
-        own rejection threshold, so |score| <= 1.0 means "conforming" and
-        |score| > 1.0 means "anomalous", regardless of which statistic or
-        threshold a particular subclass uses internally. This makes severity
-        directly comparable *across* validator types, which greedy/stepwise
-        elimination strategies rely on to rank observations by "how bad" they
-        are rather than just whether they crossed the line.
+    @abstractmethod
+    def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
+        """
+        Computes a severity for each observation.
+
+        The score from the underlying test statistic compared to the validator's
+        own rejection critarium; severity <= 1.0 means "conforming" and
+        severity > 1.0 means "anomalous", regardless of which test statistic 
+        a particular subclass uses internally. This makes severity directly 
+        comparable *across* validator types, which greedy/stepwise elimination 
+        strategies rely on to rank observations by "how bad" they are rather 
+        than just whether they crossed the line.
 
         NaN indicates no baseline could be established for that observation
         (e.g. no surviving reconstruction traces at that coordinate) and is
@@ -73,7 +74,7 @@ class BaseValidator(ABC):
         recon_rows = flow_df[recon_mask].dropna(subset=["volume"])
 
         if recon_rows.empty:
-            return pd.DataFrame(columns=["baseline", "baseline_error"])
+            return pd.DataFrame(columns=["baseline", "baseline_error", "n_effective"])
 
         # 2. Compute baseline EXACTLY ONCE per unique spatial-temporal coordinate
         return (
@@ -86,31 +87,31 @@ class BaseValidator(ABC):
         """
         Aligns a per-coordinate baseline table (as returned by
         `compute_baseline`) onto arbitrary target rows — the merge-by-
-        coordinate step every subclass's score() previously duplicated.
+        coordinate step every subclass's severity_score() previously duplicated.
 
         Returns
         -------
         pd.DataFrame
-            Columns ["baseline", "baseline_error"], aligned to
+            Columns ["baseline", "baseline_error", "n_effective"], aligned to
             target_rows.index. NaN where no baseline exists for that row's
             coordinate (e.g. no surviving reconstruction there).
         """
         if lookup_map.empty:
-            return pd.DataFrame(np.nan, index=target_rows.index, columns=["baseline", "baseline_error"])
+            return pd.DataFrame(np.nan, index=target_rows.index, columns=["baseline", "baseline_error", "n_effective"])
 
         obs_coords = target_rows[["road_section_id", "timestamp", "vehicle_type"]].reset_index()
         baseline = obs_coords.merge(
             lookup_map, 
             on=["road_section_id", "timestamp", "vehicle_type"], 
             how="left"
-        ).set_index("index")[["baseline", "baseline_error"]]
+        ).set_index("index")[["baseline", "baseline_error", "n_effective"]]
         return baseline
 
     def validate(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
         """
         Executes validation on the specified target indices by thresholding
-        score() at |severity| == 1.0. Subclasses generally shouldn't need to
-        override this — implement score() instead.
+        severity_score() at |severity| == 1.0. Subclasses generally shouldn't need to
+        override this — implement severity_score() instead.
 
         Returns
         -------
@@ -119,7 +120,7 @@ class BaseValidator(ABC):
         anomalies_indices : pd.Index
             Indices of observations that do not conform (rejected).
         """
-        severity = self.score(store, obs_indices)
+        severity = self.severity_score(store, obs_indices)
         conforming = severity[severity.abs() <= 1.0].index
         anomalies = severity[severity.abs() > 1.0].index
         return conforming, anomalies
@@ -129,10 +130,10 @@ class BaseValidator(ABC):
         v = flow_df["volume"].to_numpy(dtype="float64")
         e = flow_df["volume_err"].to_numpy(dtype="float64")
         w = flow_df["weight"].to_numpy(dtype="float64")
-        mean, std = utils.weighted_mean_and_error(v, e, w)
+        mean, std, n_eff = utils.weighted_mean_and_error(v, e, w, return_n_effective=True)
         median = np.median(v)
         baseline = mean*(1.-median_mixing_fraction) + median*median_mixing_fraction
-        return pd.Series({"baseline": baseline, "baseline_error": std})
+        return pd.Series({"baseline": baseline, "baseline_error": std, "n_effective": n_eff})
     
     @staticmethod
     def _calc_median_and_mad(flow_df: pd.DataFrame, poisson_floor_factor: float = 1.0) -> pd.Series:
@@ -150,21 +151,50 @@ class BaseValidator(ABC):
         poisson_floor = poisson_floor_factor * np.sqrt(max(median, 1.0))
         mad = max(mad, poisson_floor)
 
-        return pd.Series({"baseline" : median, "baseline_error": mad})
+        return pd.Series({"baseline" : median, "baseline_error": mad, "n_effective": n})
 
 
-class ZScoreValidator(BaseValidator):
+class StatisticalValidator(BaseValidator):
+    """
+    Abstract base class for validators that use a statistical test to compare
+    observations against a baseline. Subclasses should implement the p-value 
+    computation for the specific test statistic they use, with the null bypothesis
+    being "observation is consistent with the baseline". The severity score is then
+    derived from the p-value and the validator's significance level.
+    """
+
+    def __init__(self, significance_level: float = 0.05, two_tailed: bool = True):
+        self._significance_level = significance_level
+        self._confidence_level = 1.0 - significance_level
+        self._two_tailed = two_tailed
+
+    def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
+        p_values, directions = self.p_value(store, obs_indices)
+        directions = np.where(directions < 0, -1, 1) 
+        return directions * -np.log10(p_values) / -np.log10(self._significance_level)
+
+    @abstractmethod
+    def p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.series]:
+        pass
+
+class ZScoreValidator(StatisticalValidator):
     """
     Standard Z-Score validation comparing observations to a weighted baseline mean.
     """
-    def __init__(self, z_threshold: float = 1.96, use_errors: bool = True, median_mixing_fraction: float = 0.):
-        self.z_threshold = z_threshold
-        self.use_errors = use_errors
+    def __init__(
+        self, 
+        significance_level: float = 0.1,
+        two_tailed: bool = True,
+        use_errors: bool = True, 
+        median_mixing_fraction: float = 0.
+    ):
+        super().__init__(significance_level=significance_level, two_tailed=two_tailed)
+        self._use_errors = use_errors
         if not (0. <= median_mixing_fraction <= 1. ):
             raise ValueError("Median mixing fraction should be a value of the interval [0,1]")
-        self.median_mixing_fraction = median_mixing_fraction
-
-    def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+        self._median_mixing_fraction = median_mixing_fraction
+    
+    def compute_z_scores(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
         df = store.dataframe.copy()
         obs_rows = df.loc[obs_indices]
         
@@ -175,37 +205,61 @@ class ZScoreValidator(BaseValidator):
         baseline = self._broadcast_baseline(lookup_map, obs_rows)
         
         # B. Calculate Z Scores
-        if self.use_errors and "volume_err" in obs_rows.columns:
+        if self._use_errors and "volume_err" in obs_rows.columns:
             # Mathematical variant that integrates observation-level uncertainties
             obs_err = obs_rows["volume_err"]
         else:
             #obs_err = pd.Series(np.nan, index=baseline.index)
             obs_err = obs_rows["volume"] * 0.  # Set observation error to small noise floor
 
-        z_scores = utils.compute_z_score(
+        z_scores = utils.standardized_difference(
             observed_val=obs_rows["volume"],
             observed_err=obs_err,
             baseline_val=baseline["baseline"],
             baseline_err=baseline["baseline_error"]
         )
 
-        # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
-        return z_scores / self.z_threshold
+        return z_scores
+
+    def p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.Series]:
+        z_scores = self.compute_z_scores(store, obs_indices)
+        p_values = 2 * stats.norm.sf(z_scores.abs()) if self._two_tailed else stats.norm.sf(z_scores)
+        return pd.Series(p_values, index=z_scores.index), pd.Series(z_scores/z_scores.abs(), index=z_scores.index)
 
     def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
-        return self._calc_weighted_mean_and_std(group, median_mixing_fraction=self.median_mixing_fraction)
+        return self._calc_weighted_mean_and_std(group, median_mixing_fraction=self._median_mixing_fraction)
 
-class ZScoreModifiedValidator(BaseValidator):
+
+class ZScoreModifiedValidator(ZScoreValidator):
     """
     Modified Z-Score validation using Median and Median Absolute Deviation (MAD).
     """
-    def __init__(self, z_threshold: float = 3.5, use_errors: bool = True, poisson_floor_factor: float = 1.):
-        # 3.5 is the standard recommended threshold for modified Z-score outliers
-        self.z_threshold = z_threshold
-        self.use_errors = use_errors
-        self.poisson_floor_factor = poisson_floor_factor
+    def __init__(
+        self, 
+        significance_level: float = .05,
+        two_tailed: bool = True,
+        use_errors: bool = True, 
+        poisson_floor_factor: float = 1.
+    ):
+        super().__init__(significance_level=significance_level, two_tailed=two_tailed)
+        self._use_errors = use_errors
+        self._poisson_floor_factor = poisson_floor_factor
 
-    def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+    def p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.Series]:
+        mod_z_scores = 0.6745 * self.compute_z_scores(store, obs_indices)  # Scale factor for MAD → std conversion
+        p_values = 2 * stats.norm.sf(mod_z_scores.abs()) if self._two_tailed else stats.norm.sf(mod_z_scores)
+        return pd.Series(p_values, index=mod_z_scores.index), pd.Series(mod_z_scores/mod_z_scores.abs(), index=mod_z_scores.index)
+    
+    def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
+        return self._calc_median_and_mad(group, poisson_floor_factor=self._poisson_floor_factor)
+
+
+class TScoreValidator(ZScoreValidator):
+    """
+    Modified Z-Score validation using Median and Median Absolute Deviation (MAD).
+    """  
+
+    def p_value(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
         df = store.dataframe.copy()
         obs_rows = df.loc[obs_indices]
         
@@ -216,25 +270,24 @@ class ZScoreModifiedValidator(BaseValidator):
         baseline = self._broadcast_baseline(lookup_map, obs_rows)
         
         # B. Calculate Z Scores
-        if self.use_errors and "volume_err" in obs_rows.columns:
+        if self._use_errors and "volume_err" in obs_rows.columns:
             # Mathematical variant that integrates observation-level uncertainties
             obs_err = obs_rows["volume_err"]
         else:
             #obs_err = pd.Series(np.nan, index=baseline.index)
             obs_err = obs_rows["volume"] * 0.  # Set observation error to small noise floor
 
-        modified_z_scores = 0.6745 * utils.compute_z_score(
+        t_scores = utils.standardized_difference(
             observed_val=obs_rows["volume"],
             observed_err=obs_err,
             baseline_val=baseline["baseline"],
             baseline_err=baseline["baseline_error"]
         )
 
-        # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold
-        return modified_z_scores / self.z_threshold
-    
-    def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
-        return self._calc_median_and_mad(group, poisson_floor_factor=self.poisson_floor_factor)
+        dof = baseline["n_effective"] - 1
+
+        p_values = 2 * stats.t.sf(t_scores.abs(), df=dof) if self._two_tailed else stats.t.sf(t_scores, df=dof)
+        return pd.Series(p_values, index=t_scores.index), pd.Series(t_scores/t_scores.abs(), index=t_scores.index)
 
 
 class RelativeErrorValidator(BaseValidator):
@@ -243,12 +296,12 @@ class RelativeErrorValidator(BaseValidator):
     """
     def __init__(self, max_percent_deviation: float = 2.0, use_median: bool = True, use_errors: bool = True):
         # Max allowed deviation (e.g. 30%)
-        self.limit = max_percent_deviation / 100.0
-        self.use_median = use_median
-        self.use_errors = use_errors
+        self._limit = max_percent_deviation / 100.0
+        self._use_median = use_median
+        self._use_errors = use_errors
         self._noise_floor = 10.
 
-    def score(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Index, pd.Index]:
+    def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
         df = store.dataframe
         obs_rows = df.loc[obs_indices]
         
@@ -260,15 +313,15 @@ class RelativeErrorValidator(BaseValidator):
         
         # B. Check relative differences
         diff_abs = (obs_rows["volume"] - baseline).abs()  
-        if self.use_errors and "volume_err" in obs_rows.columns:
+        if self._use_errors and "volume_err" in obs_rows.columns:
             safe_err = obs_rows["volume_err"].fillna(0)
             diff_abs = (diff_abs - safe_err).clip(lower=0.)
 
         # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold.
         # diff_abs is already non-negative, so this ratio is an unsigned severity —
         # fine for magnitude-based ranking, it just carries no over/under direction.
-        limit_val = (baseline * self.limit).clip(lower=self._noise_floor)
+        limit_val = (baseline * self._limit).clip(lower=self._noise_floor)
         return diff_abs / limit_val
     
     def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
-        return self._calc_median_and_mad(group) if self.use_median else self._calc_weighted_mean_and_std(group)
+        return self._calc_median_and_mad(group) if self._use_median else self._calc_weighted_mean_and_std(group)
