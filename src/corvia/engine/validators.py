@@ -170,8 +170,10 @@ class StatisticalValidator(BaseValidator):
 
     def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
         p_values, directions = self.p_value(store, obs_indices)
-        directions = np.where(directions < 0, -1, 1) 
-        return directions * -np.log10(p_values) / -np.log10(self._significance_level)
+        directions = np.where(directions < 0, -1, 1)
+        # Compute log10 safely only where p > 0
+        with np.errstate(divide='ignore'):
+            return directions * -np.log10(p_values) / -np.log10(self._significance_level)
 
     @abstractmethod
     def p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.series]:
@@ -224,7 +226,8 @@ class ZScoreValidator(StatisticalValidator):
     def p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.Series]:
         z_scores = self.compute_z_scores(store, obs_indices)
         p_values = 2 * stats.norm.sf(z_scores.abs()) if self._two_tailed else stats.norm.sf(z_scores)
-        return pd.Series(p_values, index=z_scores.index), pd.Series(z_scores/z_scores.abs(), index=z_scores.index)
+        p_values = pd.Series(p_values, index=z_scores.index)
+        return p_values, pd.Series(z_scores/z_scores.abs(), index=z_scores.index)
 
     def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
         return self._calc_weighted_mean_and_std(group, median_mixing_fraction=self._median_mixing_fraction)
