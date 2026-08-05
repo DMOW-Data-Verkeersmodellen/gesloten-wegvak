@@ -28,7 +28,7 @@ import geopandas as gpd
 from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
 
-from corvia.loaders.base_network import BaseNetworkLoader
+from corvia.loaders.network.base import BaseNetworkLoader
 
 
 class VCNetworkLoader(BaseNetworkLoader):
