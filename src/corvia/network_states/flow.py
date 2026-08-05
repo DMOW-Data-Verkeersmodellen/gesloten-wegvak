@@ -27,23 +27,58 @@ class FlowStore():
     COLUMNS = ["road_section_id", "timestamp", "vehicle_type", 
                "volume", "volume_err", "source_type", "source_id", 
                "weight", "screening", "validation"]
+
+    VTYPE_DEFAULTS = ("PW", "VR", "TOTAL", "PAE")
     
     SCREENING_STATES = {"unknown", "accepted", "disputed", "held", "void", "NA"}
     VALIDATION_STATES = {"pending", "verified", "unresolved", "rejected", "NA"}
 
-    def __init__(self) -> None:
+    def __init__(self, vehicle_types: Optional[Tuple[str, ...]] = VTYPE_DEFAULTS) -> None:
+        self._vehicle_types = tuple(vehicle_types) if vehicle_types is not None else None
         self._df = self._create_empty_matrix()
+
+    @classmethod
+    def from_dataframe(
+        cls, 
+        df: pd.DataFrame,
+        vehicle_types: Optional[Tuple[str, ...]] = VTYPE_DEFAULTS,
+    ) -> FlowStore:
+        """
+        Build a FlowStore directly from a prepared dataframe.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Must contain every column in :attr:`COLUMNS`; see
+            :meth:`append_estimates` for what happens to anything else.
+        vehicle_types : tuple of str or None, optional
+            Forwarded to the new store's constructor. Defaults to
+            ``("PW", "VR", "TOTAL", "PAE")``; pass ``None`` for no
+            restriction.
+
+        Returns
+        -------
+        FlowStore
+        """
+        store = cls(vehicle_types=vehicle_types)
+        store.append_estimates(df)
+        return store
 
     def _create_empty_matrix(self) -> pd.DataFrame:
         """Initializes schema using tight data types to optimize memory footprint."""
         screening_type = pd.CategoricalDtype(categories=list(self.SCREENING_STATES))
         validation_type = pd.CategoricalDtype(categories=list(self.VALIDATION_STATES))
+        vehicle_type_dtype = (
+            pd.CategoricalDtype(categories=list(self._vehicle_types))
+            if self._vehicle_types is not None
+            else "category"
+        )
 
         df = pd.DataFrame(columns=self.COLUMNS)
         df = pd.DataFrame({
             "road_section_id": pd.Series(dtype="string"),
             "timestamp": pd.Series(dtype="datetime64[ns]"),
-            "vehicle_type": pd.Series(dtype="category"),
+            "vehicle_type": pd.Series(dtype=vehicle_type_dtype),
             "volume": pd.Series(dtype="float32"),
             "volume_err": pd.Series(dtype="float32"),
             "source_type": pd.Series(dtype="category"),
@@ -53,7 +88,6 @@ class FlowStore():
             "validation": pd.Series(dtype=validation_type)
         })
         # Explicit categories restrict memory expansion over large timelines
-        df["vehicle_type"] = df["vehicle_type"].cat.set_categories(["PW", "VR"])
         df["source_type"] = df["source_type"].cat.set_categories([self.SOURCE_OBS, self.SOURCE_REC])
         return df
 
@@ -61,6 +95,15 @@ class FlowStore():
     def dataframe(self) -> pd.DataFrame:
         """pd.DataFrame: Access the underlying pandas matrix for analysis."""
         return self._df.copy()
+
+    @property
+    def vehicle_types(self) -> Optional[Tuple[str, ...]]:
+        """
+        tuple of str or None : Allowed ``vehicle_type`` categories for
+        this store *(read-only)*. ``None`` means unrestricted — no
+        ``vehicle_type`` validation is performed by :meth:`append_estimates`.
+        """
+        return self._vehicle_types
 
     def set_validation_state(self, indices: pd.Index | list | np.array, state: str) -> None:
         """Sets the dynamic validation state ('verified', 'unresolved', 'rejected', 'pending') for given indices."""
@@ -75,8 +118,37 @@ class FlowStore():
         self._df = self._df[self._df["source_type"] != self.SOURCE_REC].reset_index(drop=True)
 
     def append_estimates(self, df_to_append: pd.DataFrame) -> None:
-        """Safely bulk-appends rows, casting columns back to expected categories."""
+        """
+        Safely bulk-appends rows, casting columns back to expected categories.
+
+        Only :attr:`COLUMNS` ever end up in the stored matrix: any other
+        column on *df_to_append* is dropped rather than silently added
+        as a new, mostly-empty column via ``pd.concat``.
+
+        Parameters
+        ----------
+        df_to_append : pd.DataFrame
+            Must contain every column in :attr:`COLUMNS`, except
+            ``screening`` and ``validation``, which fall back to
+            ``"unknown"`` and ``"pending"`` respectively when absent.
+
+        Raises
+        ------
+        ValueError
+            If a required column is missing, or if ``screening``,
+            ``validation``, or (when this store restricts it via
+            :attr:`vehicle_types`) ``vehicle_type`` contains a value
+            outside its allowed set.
+        """
         df_copy = df_to_append.copy()
+
+        # 0. Every column the matrix needs must be present, aside from
+        #    the two that fall back to a default below.
+        optional_with_default = {"screening", "validation"}
+        required = [c for c in self.COLUMNS if c not in optional_with_default]
+        missing = [c for c in required if c not in df_copy.columns]
+        if missing:
+            raise ValueError(f"Cannot append: missing required columns: {missing}")
 
         # 1. Check and validate "screening" values if present in incoming data
         if "screening" in df_copy.columns:
@@ -101,13 +173,33 @@ class FlowStore():
                     f"Must be one of {self.VALIDATION_STATES}"
                 )
         else:
-            # Default state as requested
+            # Default state
             df_copy["validation"] = "pending"
 
-        # 3. Cast to Categories for memory optimization
+        # 3. Check "vehicle_type" values against this store's allowed
+        #    set, when it has one (None means unrestricted).
+        if self._vehicle_types is not None:
+            incoming_vehicle_type = set(df_copy["vehicle_type"].dropna().unique())
+            invalid_vt = incoming_vehicle_type - set(self._vehicle_types)
+            if invalid_vt:
+                raise ValueError(
+                    f"Cannot append: 'vehicle_type' column contains invalid values: {invalid_vt}. "
+                    f"Must be one of {self._vehicle_types}"
+                )
+
+        # 4. Cast to the right types to avoid memory bloat and ensure consistency
+        df_copy["road_section_id"] = df_copy["road_section_id"].astype("string")
+        df_copy["timestamp"] = pd.to_datetime(df_copy["timestamp"], errors="coerce")
+        df_copy["source_id"] = df_copy["source_id"].astype("string")
+        for col in ["volume", "volume_err", "weight"]:
+            df_copy[col] = pd.to_numeric(df_copy[col], errors="coerce").astype("float32")
         for col in ["source_type", "vehicle_type", "screening", "validation"]:
-            if col in df_copy.columns:
-                df_copy[col] = df_copy[col].astype("category")
+            df_copy[col] = df_copy[col].astype("category")
+
+        # 5. Restrict to exactly COLUMNS — concatenating mismatched
+        #    columns would otherwise silently add new, mostly-empty
+        #    columns to the matrix instead of raising.
+        df_copy = df_copy[self.COLUMNS]
         
         self._df = pd.concat([self._df, df_copy], ignore_index=True)
 

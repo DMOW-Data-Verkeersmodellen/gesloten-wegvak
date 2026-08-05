@@ -233,6 +233,7 @@ class FlowResolver:
                     .rename(columns={"baseline": "volume", "baseline_error": "volume_err"})
                 )
                 resolved_df["source_type"] = FlowStore.SOURCE_RES
+                resolved_df["source_id"] = f"{self.__class__.__name__}-baseline"
                 resolved_df["validation"] = "NA"
                 resolved_df["weight"] = 1.0
                 store.append_estimates(resolved_df)
