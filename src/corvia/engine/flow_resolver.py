@@ -82,15 +82,21 @@ class FlowResolver:
     ) -> FlowStore:
         """Runs adaptive iterations until the network data clears or stabilizes."""
         
-        snapshots = []
-        prev_deferred_indices = None  # over-threshold survivors left unrejected at the end of the last pass
-        adaptive_multiplier = 1
-        resolver_converged = False
+        resolver_converged = {vt: False for vt in vehicle_types}
+        resolver_done = {vt: False for vt in vehicle_types}
+        prev_deferred_indices = {vt: None for vt in vehicle_types}  # over-threshold survivors left unrejected at the end of the last pass
+        adaptive_multiplier = {vt: 1 for vt in vehicle_types}
+        snapshots = {vt: [] for vt in vehicle_types}
+        final_iteration = {vt: 0 for vt in vehicle_types}
 
         if self.greedy_elimination:
             print("Running FlowResolver GREEDILY")
 
         for iteration in range(1, self.max_iterations + 1):
+            active_vtypes = [vt for vt in vehicle_types if not resolver_done[vt]]
+            if not active_vtypes:
+                break
+
             print(f"[Pass {iteration}] Generating network estimations...")
             store.clear_reconstructions()
             
@@ -101,148 +107,203 @@ class FlowResolver:
                     store.append_estimates(recon_df)
 
             df = store.dataframe
-            
-            # 2. Extract active raw observations to test
-            obs_mask = (
-                (df["source_type"] == FlowStore.SOURCE_OBS)
-                & (~df["screening"].isin(["void", "NA"]))     
-            )
-            if self.greedy_elimination:
-                obs_mask = (obs_mask & (df["validation"] != "rejected"))
-            obs_rows = df[obs_mask]
-            if obs_rows.empty:
+
+            for vt in active_vtypes:
+                final_iteration[vt] = iteration
+                done, converged = self._run_vtype_pass(
+                    store, df, vt, iteration,
+                    prev_deferred_indices, adaptive_multiplier, snapshots,
+                )
+                resolver_done[vt] = done
+                resolver_converged[vt] = converged
+
+            if all(resolver_done.values()):
                 break
 
-            store.set_validation_state(obs_rows.index, "pending")       
-            
-            # 5. Execute validation and classification choices
-            severity = self.validator.severity_score(store, obs_rows.index)
-            conforming_indices = severity[severity.abs() <= 1.0].index
-            anomalies_indices = severity[severity.abs() > 1.0].index
-
-            anomalies_ranked = severity.loc[anomalies_indices].abs().sort_values(ascending=False).index
-            if self.greedy_elimination:
-                base_k = self._select_rejection_batch_size(len(anomalies_ranked), len(obs_rows))
-
-                if self.greedy_adaptive_batch:
-                    # If last pass's rejection left the flagged set completely unchanged —
-                    # nobody got rescued, nobody new got exposed — that's empirical proof
-                    # those observations weren't coupled to anything we removed, so it's
-                    # safe to move faster. Anything else (a rescue, a newly-exposed
-                    # anomaly, or no history yet) resets us back to the cautious baseline.
-                    unchanged = (
-                        prev_deferred_indices is not None
-                        and pd.Index(anomalies_ranked).symmetric_difference(prev_deferred_indices).empty
-                    )
-                    adaptive_multiplier = adaptive_multiplier * 2 if unchanged else 1
-                    k = min(base_k * adaptive_multiplier, len(anomalies_ranked))
-                else:
-                    k = base_k
-
-                rejected_this_pass = anomalies_ranked[:k]
-                deferred_indices = anomalies_ranked[k:]  # over threshold, but not yet rejected
-                prev_deferred_indices = deferred_indices
-            else:
-                rejected_this_pass = anomalies_ranked
-                deferred_indices = pd.Index([])
-            
-            store.set_validation_state(obs_rows.index, "unresolved")
-            store.set_validation_state(conforming_indices, "verified")
-            store.set_validation_state(rejected_this_pass, "rejected")
-            # deferred_indices are left "unresolved" — they're over threshold this pass,
-            # but the baseline is still contaminated by worse offenders, so we hold off
-            # judgement until those are gone and the baseline is recomputed next pass.
-
-            validated_idx = pd.Index(conforming_indices).union(pd.Index(anomalies_indices)) 
-            failed_indices = obs_rows.index.difference(validated_idx)
-            if len(failed_indices) == len(obs_rows) and len(obs_rows) > 0:
-                print(
-                    f"CRITICAL: Reconstruction failed completely for all {len(obs_rows)} observations. "
-                    f"No baseline consensus could be computed. Breaking resolving loop."
-                )
-                break
-            elif len(failed_indices) > 0:
-                print(
-                    f"WARNING: Reconstruction failed to generate consensus baselines for {len(failed_indices)} "
-                    f"observations. These values remain in a 'unresolved' state."
-                )
-
-            # 6. Track the history and look for convergence
-            snapshots.append((iteration,store.dataframe.copy()))
-            rejected_mask = (
-                (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
-                & (store.dataframe["validation"] == "rejected")
-            )
-    
-            if len(anomalies_indices) == 0:
-                rejected_mask = (
-                    (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
-                    & (store.dataframe["validation"] == "rejected")
-                )
-                print(f"--> Architecture converged cleanly at iteration {iteration}")
-                print(f"--> {int(rejected_mask.sum())} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
-                resolver_converged=True
-                break
-
-            if self.greedy_elimination:
-                print(
-                    f"--> Pool shrinking: {len(anomalies_ranked)} remain over threshold, "
-                    f"rejected top {len(rejected_this_pass)}, deferred {len(deferred_indices)} for re-scoring."
-                )
-                print(f"--> {int(rejected_mask.sum())} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
-            else:
-                current_validation = (
-                    store.dataframe[store.dataframe["source_type"] == FlowStore.SOURCE_OBS]
-                    .set_index(["source_id", "timestamp", "vehicle_type"])["validation"]
-                    .sort_index()
-                )
-
-                detected_duplicate = False
-                duplicate_iteration = None
-                for prev_idx, prev_df_copy in snapshots[:-1]:
-                    prev_validation = (
-                        prev_df_copy[prev_df_copy["source_type"] == FlowStore.SOURCE_OBS]
-                        .set_index(["source_id", "timestamp", "vehicle_type"])["validation"]
-                        .sort_index()
-                    )
-                    # Compare the validation categories row-by-row
-                    if prev_validation.equals(current_validation):
-                        detected_duplicate = True
-                        duplicate_iteration = prev_idx
-                        break
-
-                if detected_duplicate:
-                    if duplicate_iteration == iteration - 1:
-                        print(f"--> Convergence reached at iteration {iteration}: Outlier validation states have stabilized.")
-                    else:
-                        print(f"--> Convergence stopped at iteration {iteration}: Detected an oscillation cycle (matches iteration {duplicate_iteration}).")
-                    resolver_converged=True
-                    break
-                else:
-                    print(f"--> No convergence found, outliers over threshold: {list(anomalies_ranked)}")
-        
         else:
-            # Executes ONLY if the loop ran max_iterations and did not execute a 'break'
-            print(f"WARNING: FlowResolver reached maximum iterations ({self.max_iterations}) without reaching convergence.")
-
-        if resolver_converged:
+            still_active = [vt for vt, done in resolver_done.items() if not done]
+            if still_active:
+                print(
+                    f"WARNING: FlowResolver reached maximum iterations ({self.max_iterations}) "
+                    f"without convergence for vehicle types: {still_active}"
+                )
+    
+        # Only publish resolved baselines for vtypes that actually converged.
+        converged_vtypes = {vt for vt, ok in resolver_converged.items() if ok}
+        if converged_vtypes:
             lookup_map = self.validator.compute_baseline(store.dataframe.copy())
             if not lookup_map.empty:
                 resolved_df = (
                     lookup_map.reset_index()
                     .rename(columns={"baseline": "volume", "baseline_error": "volume_err"})
                 )
-                resolved_df["source_type"] = FlowStore.SOURCE_RES
-                resolved_df["source_id"] = f"{self.__class__.__name__}-baseline"
-                resolved_df["validation"] = "NA"
-                resolved_df["weight"] = 1.0
-                store.append_estimates(resolved_df)
-        
+                resolved_df = resolved_df[resolved_df["vehicle_type"].isin(converged_vtypes)]
+                if not resolved_df.empty:
+                    resolved_df["source_type"] = FlowStore.SOURCE_RES
+                    resolved_df["source_id"] = f"{self.__class__.__name__}-baseline"
+                    resolved_df["validation"] = "NA"
+                    resolved_df["weight"] = 1.0
+                    store.append_estimates(resolved_df)
+    
         if self.debug_plot:
-            self.plot_iteration_snapshot(iteration,store,periods[0],vehicle_types[0])
-            #self.plot_iteration_summary(snapshots)
-
+            for vt in vehicle_types:
+                self.plot_iteration_snapshot(final_iteration[vt] or 1, store, periods[0], vt)
+            #self.plot_iteration_summary(snapshots)  # would need a per-vtype rework too, see note below
+    
         return store
+
+    def _run_vtype_pass(
+        self,
+        store: FlowStore,
+        df: pd.DataFrame,
+        vt: str,
+        iteration: int,
+        prev_deferred_indices: dict,
+        adaptive_multiplier: dict,
+        snapshots: dict,
+    ) -> Tuple[bool, bool]:
+        """
+        Runs validation/rejection bookkeeping for a single vehicle type within
+        one pass.
+
+        Returns
+        -------
+        (done, converged) : tuple of bool
+            done : True if this vehicle type should stop being processed in
+            subsequent passes (either because it converged, or because it
+            failed critically and further passes won't help).
+            converged : True if a resolved baseline should be published for
+            this vehicle type once the whole run finishes.
+        """
+        
+
+        # 1. Extract active raw observations to test
+        obs_mask = (
+            (df["source_type"] == FlowStore.SOURCE_OBS)
+            & (df["vehicle_type"] == vt)
+            & (~df["screening"].isin(["void", "NA"]))     
+        )
+        if self.greedy_elimination:
+            obs_mask = (obs_mask & (df["validation"] != "rejected"))
+        obs_rows = df[obs_mask]
+        if obs_rows.empty:
+            return True, False
+
+        store.set_validation_state(obs_rows.index, "pending")       
+            
+        # 2 Execute validation and classification choices
+        severity = self.validator.severity_score(store, obs_rows.index)
+        conforming_indices = severity[severity.abs() <= 1.0].index
+        anomalies_indices = severity[severity.abs() > 1.0].index
+        anomalies_ranked = severity.loc[anomalies_indices].abs().sort_values(ascending=False).index
+
+        if self.greedy_elimination:
+            base_k = self._select_rejection_batch_size(len(anomalies_ranked), len(obs_rows))
+
+            if self.greedy_adaptive_batch:
+                # If last pass's rejection left the flagged set completely unchanged —
+                # nobody got rescued, nobody new got exposed — that's empirical proof
+                # those observations weren't coupled to anything we removed, so it's
+                # safe to move faster. Anything else (a rescue, a newly-exposed
+                # anomaly, or no history yet) resets us back to the cautious baseline.
+                prev_deferred_idx = prev_deferred_indices[vt]
+                unchanged = (
+                    prev_deferred_idx is not None
+                    and pd.Index(anomalies_ranked).symmetric_difference(prev_deferred_idx).empty
+                )
+                adaptive_multiplier[vt] = adaptive_multiplier[vt] * 2 if unchanged else 1
+                k = min(base_k * adaptive_multiplier[vt], len(anomalies_ranked))
+            else:
+                k = base_k
+
+            rejected_this_pass = anomalies_ranked[:k]
+            deferred_indices = anomalies_ranked[k:]  # over threshold, but not yet rejected
+            prev_deferred_indices[vt] = deferred_indices
+        else:
+            rejected_this_pass = anomalies_ranked
+            deferred_indices = pd.Index([])
+            
+        store.set_validation_state(obs_rows.index, "unresolved")
+        store.set_validation_state(conforming_indices, "verified")
+        store.set_validation_state(rejected_this_pass, "rejected")
+        # deferred_indices are left "unresolved" — they're over threshold this pass,
+        # but the baseline is still contaminated by worse offenders, so we hold off
+        # judgement until those are gone and the baseline is recomputed next pass.
+
+        validated_idx = pd.Index(conforming_indices).union(pd.Index(anomalies_indices)) 
+        failed_indices = obs_rows.index.difference(validated_idx)
+        if len(failed_indices) == len(obs_rows) and len(obs_rows) > 0:
+            print(
+                f"CRITICAL: Reconstruction {vt} failed completely for all {len(obs_rows)} observations. "
+                f"No baseline consensus could be computed. Breaking resolving loop."
+            )
+            return True, False
+        elif len(failed_indices) > 0:
+            print(
+                f"WARNING: Reconstruction {vt} failed to generate consensus baselines for {len(failed_indices)} "
+                f"observations. These values remain in a 'unresolved' state."
+            )
+
+        # 6. Track the history and look for convergence
+        snapshots[vt].append((iteration,store.dataframe.copy()))
+        rejected_mask = (
+            (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
+            & (store.dataframe["vehicle_type"] == vt)
+            & (store.dataframe["validation"] == "rejected")
+        )
+
+        if len(anomalies_indices) == 0:
+            rejected_mask = (
+                (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
+                & (store.dataframe["validation"] == "rejected")
+            )
+            print(f"--> Architecture converged cleanly for {vt} at iteration {iteration}")
+            print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
+            return True, True
+
+        if self.greedy_elimination:
+            print(
+                f"--> Pool {vt} shrinking: {len(anomalies_ranked)} remain over threshold, "
+                f"rejected top {len(rejected_this_pass)}, deferred {len(deferred_indices)} for re-scoring."
+            )
+            print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
+            return False, False
+
+        current_validation = (
+            store.dataframe[
+                (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
+                & (store.dataframe["vehicle_type"] == vt)
+            ]
+            .set_index(["source_id", "timestamp", "vehicle_type"])["validation"]
+            .sort_index()
+        )
+
+        detected_duplicate = False
+        duplicate_iteration = None
+        for prev_idx, prev_df_copy in snapshots[vt][:-1]:
+            prev_validation = (
+                prev_df_copy[
+                    (prev_df_copy["source_type"] == FlowStore.SOURCE_OBS)
+                    & (prev_df_copy["vehicle_type"] == vt)
+                ]
+                .set_index(["source_id", "timestamp", "vehicle_type"])["validation"]
+                .sort_index()
+            )
+            # Compare the validation categories row-by-row
+            if prev_validation.equals(current_validation):
+                detected_duplicate = True
+                duplicate_iteration = prev_idx
+                break
+
+        if detected_duplicate:
+            if duplicate_iteration == iteration - 1:
+                print(f"--> Convergence for {vt} reached at iteration {iteration}: Outlier validation states have stabilized.")
+            else:
+                print(f"--> Convergence for {vt} stopped at iteration {iteration}: Detected an oscillation cycle (matches iteration {duplicate_iteration}).")
+            return True, True
+        
+        print(f"--> No convergence found for {vt}, outliers over threshold: {list(anomalies_ranked)}")
+        return False, False
     
     def set_plotting_restrictions(self, 
             sections_to_plot: Optional[List[str]] = None,
@@ -315,7 +376,7 @@ class FlowResolver:
                     reco_stds.append(np.nan)
                 else:
                     m, s = weighted_mean_and_error(
-                        sub["volume"].to_numpy(), sub["volume_err"].to_numpy(), sub["weight"].to_numpy()
+                        sub["volume"].to_numpy(), sub["volume_err"].to_numpy(), sub["weight"].to_numpy(), label="plot"+sec_id
                     )
                     reco_means.append(m)
                     reco_stds.append(s)
@@ -434,28 +495,49 @@ class FlowResolver:
             plt.close()
 
     def plot_iteration_summary(
+        self,
+        snapshots: dict,
+    ) -> None:
+        """
+        Generates comparative dashboard grids across multiple iterations,
+        one dashboard set per vehicle type.
+
+        Vehicle types no longer run in lockstep (each converges/stops on its
+        own schedule), so `snapshots` is keyed by vehicle_type, and each
+        vtype gets its own set of dashboards sized to its own iteration count.
+
+        Parameters
+        ----------
+        snapshots : dict
+            Mapping of vehicle_type -> list of (iteration, store.dataframe
+            copy) tuples, as accumulated in `run()`.
+        """
+        for vt, historical_states in snapshots.items():
+            if not historical_states:
+                continue
+            self._plot_iteration_summary_for_vtype(vt, historical_states)
+
+    def _plot_iteration_summary_for_vtype(
         self, 
+        vehicle_type: str,
         historical_states: List[Tuple[int, pd.DataFrame]]
     ) -> None:
         """
         Generates comparative dashboard grids across multiple iterations, 
         ensuring proper row height dimensions and de-duplicated external legends.
         """
-        if not historical_states:
-            return
-
         first_df = historical_states[0][1]
-        unique_combinations = (
-            first_df[["timestamp", "vehicle_type"]]
+        unique_timestamps = (
+            first_df.loc[first_df["vehicle_type"] == vehicle_type, "timestamp"]
             .drop_duplicates()
-            .to_records(index=False)
+            .tolist()
         )
 
         RECO_DATA_OFFSET = -0.15
         RECO_MEAN_OFFSET = 0.15
         num_iters = len(historical_states)
 
-        for timestamp_np, vehicle_type in unique_combinations:
+        for timestamp_np in unique_timestamps:
             timestamp = pd.Timestamp(timestamp_np)
 
             # Determine unique section across all iterations
@@ -528,7 +610,7 @@ class FlowResolver:
                             reco_stds.append(np.nan)
                         else:
                             m, s = weighted_mean_and_error(
-                                sub["volume"].to_numpy(), sub["volume_err"].to_numpy(), sub["weight"].to_numpy()
+                                sub["volume"].to_numpy(), sub["volume_err"].to_numpy(), sub["weight"].to_numpy(), label="plot"+sec_id
                             )
                             reco_means.append(m)
                             reco_stds.append(s)
