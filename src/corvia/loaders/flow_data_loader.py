@@ -17,12 +17,10 @@ Dependency chain::
 
 from __future__ import annotations
 
-import logging
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.frequencies import to_offset
 
 from corvia.framework.network import Network
 from corvia.network_states.flow import FlowStore
@@ -69,6 +67,8 @@ class VCFlowDataLoader:
     ----------
     csv_filenames : list of str, optional
         Paths to the raw measurement CSVs. Only required for :meth:`aggregate` 
+    time_delta : pd.Timedelta, optional
+        The duration of a measurement in seconds.
     agg_freq : str, optional
         Any pandas offset alias — ``"15min"``, ``"1h"``, ``"6h"``,
         ``"1D"``, ``"1W"``, … Defaults to ``"1D"``.
@@ -76,7 +76,7 @@ class VCFlowDataLoader:
         Passenger-car-equivalent factor applied to truck volumes when
         computing ``volume_PAE``. Defaults to ``2.0``.
     start, end : str or pandas.Timestamp, optional
-        Restrict aggregation to ``[start, end]`` (inclusive). ``None``
+        Restrict aggregation to ``[start, end)`` (inclusive, exclusive). ``None``
         (default, for either bound) keeps everything on that side.
     delimiter : str, optional
         CSV delimiter for the *raw* files read by :meth:`aggregate`.
@@ -95,6 +95,7 @@ class VCFlowDataLoader:
     Attributes
     ----------
     _csv_filenames : list of str or None
+    _time_interval : pd.Timedelta or None
     _agg_freq : str
     _pae_factor : float
     _start : pandas.Timestamp or None
@@ -130,6 +131,7 @@ class VCFlowDataLoader:
     def __init__(
         self,
         csv_filenames: Optional[List[str]] = None,
+        time_delta: Optional[pd.Timedelta] = None,
         agg_freq: str = "1D",
         pae_factor: float = 2.0,
         start: Optional[str] = None,
@@ -139,6 +141,7 @@ class VCFlowDataLoader:
         volume_err_fn: Optional[Callable[[pd.DataFrame], pd.Series]] = None,
     ) -> None:
         self._csv_filenames: Optional[List[str]] = list(csv_filenames) if csv_filenames is not None else None
+        self._time_delta=time_delta if time_delta is not None else None
         self._agg_freq: str = agg_freq
         self._pae_factor: float = pae_factor
         self._start: Optional[pd.Timestamp] = pd.Timestamp(start) if start else None
@@ -178,7 +181,7 @@ class VCFlowDataLoader:
             raise ValueError("aggregate() needs csv_filenames — none were given to FlowDataLoader().")
 
         df = self._read_and_clean()
-        df = self._filter_period(df, time_column="TIME_MEASURED")
+        df = self._filter_period(df, time_column="TIME_MEASURED", dT=self._time_delta)
         if df.empty:
             raise ValueError(
                 "No records found in the requested start/end range. "
@@ -233,7 +236,6 @@ class VCFlowDataLoader:
                 print(f"> WARNING: {report} not found. Aggregating raw data and saving it to requested file.")
                 df = self.aggregate(output_path=report, output_delimiter=delimiter)
 
-        #df = self.aggregate() if report is None else self._read_report(report, delimiter)
         df = self._map_sections(df, network)
         df = self._melt_vehicle_types(df)
         return self._finalize(df)
@@ -298,7 +300,7 @@ class VCFlowDataLoader:
 
     def _filter_period(self, df: pd.DataFrame, time_column: str, dT: Optional[pd.Timedelta] = None) -> pd.DataFrame:
         """
-        Restrict to ``[start, end]``.
+        Restrict to ``[start, end)``.
 
         Parameters
         ----------
@@ -312,11 +314,10 @@ class VCFlowDataLoader:
         -------
         pandas.DataFrame
         """
-        dT = self._find_common_timeinterval(df, time_column) if dT is None else dT
         if self._start is not None:
             df = df[df[time_column] >= self._start]
         if self._end is not None:
-            df = df[df[time_column] < self._end] if dT is None else df[df[time_column] <= self._end + dT]
+            df = df[df[time_column] < self._end] if dT is None else df[df[time_column] + dT <= self._end]
         return df.copy()
 
     def _compute_volumes(self, df: pd.DataFrame) -> pd.DataFrame:

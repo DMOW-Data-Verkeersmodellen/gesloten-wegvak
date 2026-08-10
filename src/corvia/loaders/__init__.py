@@ -7,10 +7,10 @@ different modules.
 """
 
 from corvia.loaders.network import BaseNetworkLoader, VCNetworkLoader
-from corvia.loaders.flow_data_loader import VCFlowStoreLoader
+from corvia.loaders.flow_data_loader import VCFlowDataLoader
 
 __all__ = [
-    "VCFlowStoreLoader", 
+    "VCFlowDataLoader", 
     "BaseNetworkLoader",
     "VCNetworkLoader", 
 ]

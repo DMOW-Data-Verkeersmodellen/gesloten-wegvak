@@ -124,6 +124,7 @@ class VCNetworkLoader(BaseNetworkLoader):
         segments_df = gpd.read_file(self._source, layer=self._links_layer)
         parts_df = gpd.read_file(self._source, layer=self._parts_layer)
         sensors_df = gpd.read_file(self._source, layer=self._sensors_layer)
+        sensors_df = sensors_df[sensors_df["LOCPOST"]<1000000]  # exclude virtual locposten
 
         nodes_data = self._build_nodes(segments_df)
         links_data = self._build_links(segments_df)
@@ -204,11 +205,21 @@ class VCNetworkLoader(BaseNetworkLoader):
         -------
         list of dict
             Records with ``location_id`` and ``link_id``. Sensors whose
-            part cannot be mapped to a known link are dropped and logged
-            via :meth:`~corvia.loaders.base.BaseNetworkLoader._warn`.
+            part cannot be mapped to a known link are dropped.
         """
         sensors = sensors_df.rename(columns=self.MAP_COLUMNS_SENSOR)
+
+        # Identify rows with missing part_id
+        loc_missing_parts = sensors[sensors["part_id"].isna()]["location_id"]
+        if len(loc_missing_parts) > 0:
+            self._warn(
+                f"[Warning] Locposts with id's '{loc_missing_parts}' skipped because it has a NULL part_id (SD_ID)."
+            )
+
+        # Filter out missing part_id rows before casting
+        sensors = sensors.dropna(subset=["part_id"]).copy()
         sensors = sensors[["location_id", "part_id"]].astype(int).astype(str)
+
         if self._include_geometry:
             sensors["geometry"] = sensors_df["geometry"]
 
