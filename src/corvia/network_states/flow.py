@@ -291,4 +291,4 @@ class FlowStore():
         e = sub["volume_err"].to_numpy(dtype="float64")
         w = sub["weight"].to_numpy(dtype="float64")
 
-        return utils.weighted_mean_and_error(v, e, w, label=road_section_id)
+        return utils.weighted_mean_and_error(v, e, w, label="consensus"+road_section_id)

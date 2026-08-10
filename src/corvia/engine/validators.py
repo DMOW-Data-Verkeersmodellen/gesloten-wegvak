@@ -130,7 +130,7 @@ class BaseValidator(ABC):
         v = flow_df["volume"].to_numpy(dtype="float64")
         e = flow_df["volume_err"].to_numpy(dtype="float64")
         w = flow_df["weight"].to_numpy(dtype="float64")
-        mean, std, n_eff = utils.weighted_mean_and_error(v, e, w, return_n_effective=True)
+        mean, std, n_eff = utils.weighted_mean_and_error(v, e, w, return_n_effective=True, label="validator")
         median = np.median(v)
         baseline = mean*(1.-median_mixing_fraction) + median*median_mixing_fraction
         return pd.Series({"baseline": baseline, "baseline_error": std, "n_effective": n_eff})
