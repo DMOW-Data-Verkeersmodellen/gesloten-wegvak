@@ -31,7 +31,7 @@ class FlowStore():
     VTYPE_DEFAULTS = ("PW", "VR", "TOTAL", "PAE")
     
     SCREENING_STATES = {"unknown", "accepted", "disputed", "held", "void", "NA"}
-    VALIDATION_STATES = {"pending", "verified", "unresolved", "rejected", "NA"}
+    VALIDATION_STATES = {"pending", "verified", "conforming", "dismissed", "rejected", "unresolved", "NA"}
 
     def __init__(self, vehicle_types: Optional[Tuple[str, ...]] = VTYPE_DEFAULTS) -> None:
         self._vehicle_types = tuple(vehicle_types) if vehicle_types is not None else None

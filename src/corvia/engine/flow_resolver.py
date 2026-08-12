@@ -21,7 +21,8 @@ class FlowResolver:
     def __init__(
         self, 
         reconstructors: List, 
-        validator: BaseValidator,
+        rejector: BaseValidator,
+        acceptor: Optional[BaseValidator] = None,
         max_iterations: int = 3,
         name: Optional[str] = None,
         debug_plot: bool = False,
@@ -32,9 +33,22 @@ class FlowResolver:
         greedy_k_pool_fraction: float = 0.05,
         greedy_k_max: int = 20,
     ) -> None:
+
+        """
+        Parameters
+        ----------
+        reconstructors : list
+        rejector : BaseValidator
+            The Rejector: runs iteratively, flags statistical outliers.
+        acceptor : BaseValidator, optional
+            Runs ONCE per vehicle type, after the network converges, to
+            verify or dismiss the remaining observations
+        ...
+        """
         
         self.reconstructors = reconstructors
-        self.validator = validator
+        self.rejector = rejector
+        self.acceptor = acceptor
         self.max_iterations = max_iterations
         self.name = name
         self.debug_plot = debug_plot
@@ -80,7 +94,8 @@ class FlowResolver:
         periods: List[pd.Timestamp], 
         vehicle_types: List[str]
     ) -> FlowStore:
-        """Runs adaptive iterations until the network data clears or stabilizes."""
+        """Runs adaptive iterations per vehicle type until each clears or
+        stabilizes, then verifies or dismisses data per converged vehicle type."""
         
         resolver_converged = {vt: False for vt in vehicle_types}
         resolver_done = {vt: False for vt in vehicle_types}
@@ -100,7 +115,7 @@ class FlowResolver:
             print(f"[Pass {iteration}] Generating network estimations...")
             store.clear_reconstructions()
             
-            # 1. Execute reconstruction engines
+            # Execute reconstruction engines
             for recon in self.reconstructors:
                 recon_df = recon.reconstruct(network, store, periods, vehicle_types)
                 if recon_df is not None and not recon_df.empty:
@@ -131,7 +146,7 @@ class FlowResolver:
         # Only publish resolved baselines for vtypes that actually converged.
         converged_vtypes = {vt for vt, ok in resolver_converged.items() if ok}
         if converged_vtypes:
-            lookup_map = self.validator.compute_baseline(store.dataframe.copy())
+            lookup_map = self.rejector.compute_baseline(store.dataframe.copy())
             if not lookup_map.empty:
                 resolved_df = (
                     lookup_map.reset_index()
@@ -163,15 +178,15 @@ class FlowResolver:
         snapshots: dict,
     ) -> Tuple[bool, bool]:
         """
-        Runs validation/rejection bookkeeping for a single vehicle type within
-        one pass.
+        Runs Rejector validation/rejection bookkeeping for a single vehicle
+        type within one pass, and — on convergence — runs the Acceptor once
+        for that vehicle type.
 
         Returns
         -------
         (done, converged) : tuple of bool
             done : True if this vehicle type should stop being processed in
-            subsequent passes (either because it converged, or because it
-            failed critically and further passes won't help).
+            subsequent passes (converged, or failed critically).
             converged : True if a resolved baseline should be published for
             this vehicle type once the whole run finishes.
         """
@@ -181,7 +196,7 @@ class FlowResolver:
         obs_mask = (
             (df["source_type"] == FlowStore.SOURCE_OBS)
             & (df["vehicle_type"] == vt)
-            & (~df["screening"].isin(["void", "NA"]))     
+            & (~df["screening"].isin(["void", "NA"]))
         )
         if self.greedy_elimination:
             obs_mask = (obs_mask & (df["validation"] != "rejected"))
@@ -189,16 +204,16 @@ class FlowResolver:
         if obs_rows.empty:
             return True, False
 
-        store.set_validation_state(obs_rows.index, "pending")       
-            
+        store.set_validation_state(obs_rows.index, "pending")
+
         # 2 Execute validation and classification choices
-        severity = self.validator.severity_score(store, obs_rows.index)
-        conforming_indices = severity[severity.abs() <= 1.0].index
-        anomalies_indices = severity[severity.abs() > 1.0].index
-        anomalies_ranked = severity.loc[anomalies_indices].abs().sort_values(ascending=False).index
+        severity = self.rejector.severity_score(store, obs_rows.index)
+        idx_conforming = severity[severity.abs() <= 1.0].index
+        idx_rejected = severity[severity.abs() > 1.0].index
+        idx_rejected_ranked = severity.loc[idx_rejected].abs().sort_values(ascending=False).index
 
         if self.greedy_elimination:
-            base_k = self._select_rejection_batch_size(len(anomalies_ranked), len(obs_rows))
+            base_k = self._select_rejection_batch_size(len(idx_rejected_ranked), len(obs_rows))
 
             if self.greedy_adaptive_batch:
                 # If last pass's rejection left the flagged set completely unchanged —
@@ -209,38 +224,38 @@ class FlowResolver:
                 prev_deferred_idx = prev_deferred_indices[vt]
                 unchanged = (
                     prev_deferred_idx is not None
-                    and pd.Index(anomalies_ranked).symmetric_difference(prev_deferred_idx).empty
+                    and pd.Index(idx_rejected_ranked).symmetric_difference(prev_deferred_idx).empty
                 )
                 adaptive_multiplier[vt] = adaptive_multiplier[vt] * 2 if unchanged else 1
-                k = min(base_k * adaptive_multiplier[vt], len(anomalies_ranked))
+                k = min(base_k * adaptive_multiplier[vt], len(idx_rejected_ranked))
             else:
                 k = base_k
 
-            rejected_this_pass = anomalies_ranked[:k]
-            deferred_indices = anomalies_ranked[k:]  # over threshold, but not yet rejected
-            prev_deferred_indices[vt] = deferred_indices
+            rejected_this_pass = idx_rejected_ranked[:k]
+            idx_deferred = idx_rejected_ranked[k:]  # over threshold, but not yet rejected
+            prev_deferred_indices[vt] = idx_deferred
         else:
-            rejected_this_pass = anomalies_ranked
-            deferred_indices = pd.Index([])
+            rejected_this_pass = idx_rejected_ranked
+            idx_deferred = pd.Index([])
             
         store.set_validation_state(obs_rows.index, "unresolved")
-        store.set_validation_state(conforming_indices, "verified")
+        store.set_validation_state(idx_conforming, "conforming")
         store.set_validation_state(rejected_this_pass, "rejected")
-        # deferred_indices are left "unresolved" — they're over threshold this pass,
+        # idx_deferred are left "unresolved" — they're over threshold this pass,
         # but the baseline is still contaminated by worse offenders, so we hold off
         # judgement until those are gone and the baseline is recomputed next pass.
 
-        validated_idx = pd.Index(conforming_indices).union(pd.Index(anomalies_indices)) 
-        failed_indices = obs_rows.index.difference(validated_idx)
-        if len(failed_indices) == len(obs_rows) and len(obs_rows) > 0:
+        validated_idx = pd.Index(idx_conforming).union(pd.Index(idx_rejected)) 
+        failed_idx = obs_rows.index.difference(validated_idx)
+        if len(failed_idx) == len(obs_rows) and len(obs_rows) > 0:
             print(
                 f"CRITICAL: Reconstruction {vt} failed completely for all {len(obs_rows)} observations. "
                 f"No baseline consensus could be computed. Breaking resolving loop."
             )
             return True, False
-        elif len(failed_indices) > 0:
+        elif len(failed_idx) > 0:
             print(
-                f"WARNING: Reconstruction {vt} failed to generate consensus baselines for {len(failed_indices)} "
+                f"WARNING: Reconstruction {vt} failed to generate consensus baselines for {len(failed_idx)} "
                 f"observations. These values remain in a 'unresolved' state."
             )
 
@@ -252,23 +267,21 @@ class FlowResolver:
             & (store.dataframe["validation"] == "rejected")
         )
 
-        if len(anomalies_indices) == 0:
-            rejected_mask = (
-                (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
-                & (store.dataframe["validation"] == "rejected")
-            )
+        if len(idx_rejected) == 0:
             print(f"--> Architecture converged cleanly for {vt} at iteration {iteration}")
             print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
+            self._run_acceptor_for_vtype(store, vt)
             return True, True
 
         if self.greedy_elimination:
             print(
-                f"--> Pool {vt} shrinking: {len(anomalies_ranked)} remain over threshold, "
-                f"rejected top {len(rejected_this_pass)}, deferred {len(deferred_indices)} for re-scoring."
+                f"--> Pool {vt} shrinking: {len(idx_rejected_ranked)} remain over threshold, "
+                f"rejected top {len(rejected_this_pass)}, deferred {len(idx_deferred)} for re-scoring."
             )
             print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
             return False, False
 
+        # Non-greedy: check this vtype's own validation history for a repeat/oscillation.
         current_validation = (
             store.dataframe[
                 (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
@@ -297,14 +310,41 @@ class FlowResolver:
 
         if detected_duplicate:
             if duplicate_iteration == iteration - 1:
-                print(f"--> Convergence for {vt} reached at iteration {iteration}: Outlier validation states have stabilized.")
+                print(f"--> Convergence for {vt} reached at iteration {iteration}: Validation states have stabilized.")
             else:
                 print(f"--> Convergence for {vt} stopped at iteration {iteration}: Detected an oscillation cycle (matches iteration {duplicate_iteration}).")
+            self._run_acceptor_for_vtype(store, vt)
             return True, True
         
-        print(f"--> No convergence found for {vt}, outliers over threshold: {list(anomalies_ranked)}")
+        print(f"--> No convergence found for {vt}, outliers over threshold: {list(idx_rejected_ranked)}")
         return False, False
     
+    def _run_acceptor_for_vtype(self, store: FlowStore, vt: str) -> None:
+        """
+        Runs self.acceptor (a BaseValidator) once for a vehicle type whose
+        Rejector pass just converged. Relabels every currently "conforming"
+        observation for this vtype as either "verified" or "dismissed".
+
+        If self.acceptor is None, every conforming row simply becomes
+        "verified" and nothing is dismissed.
+        """
+        conforming_mask = (
+            (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
+            & (store.dataframe["vehicle_type"] == vt)
+            & (store.dataframe["validation"] == "conforming")
+        )
+        conforming_idx = store.dataframe[conforming_mask].index
+        if conforming_idx.empty:
+            return
+
+        if self.acceptor is None:
+            store.set_validation_state(conforming_idx, "verified")
+            return
+
+        verified_idx, dismissed_idx = self.acceptor.validate(store, conforming_idx)
+        store.set_validation_state(verified_idx, "verified")
+        store.set_validation_state(dismissed_idx, "dismissed")
+
     def set_plotting_restrictions(self, 
             sections_to_plot: Optional[List[str]] = None,
             sections_per_plot: int = 20
@@ -408,16 +448,20 @@ class FlowResolver:
 
                 if row["validation"] == "rejected":
                     colour = "#d62728"  # Red
-                    fmt = "x"
+                    fmt = "X"
                     label_str = "Observation - Rejected (Outlier)"
-                elif row["validation"] == "unresolved":
+                elif row["validation"] == "dimissed":
                     colour = "#ff7f0e"  # Orange
-                    fmt = "^"          # Triangle
-                    label_str = "Observation - Unresolved"
-                else:
+                    fmt = "D"          # Triangle
+                    label_str = "Observation - dismissed"
+                elif row["validation"] == "verified":
                     colour = "#2ca02c"  # Green
                     fmt = "o"          # Circle
                     label_str = "Observation - Verified"
+                else:
+                    colour = "#666666"  # Green
+                    fmt = "o"          # Circle
+                    label_str = "Observation - Unresolved"
 
                 if row["screening"] == "held":
                     colour = "#8320f3"
@@ -442,16 +486,20 @@ class FlowResolver:
 
                 if row["validation"] == "rejected":
                     colour = "#d62728"  # Red
-                    fmt = "x"
+                    fmt = "X"
                     label_str = "Observation - Rejected (Outlier)"
-                elif row["validation"] == "unresolved":
+                elif row["validation"] == "dimissed":
                     colour = "#ff7f0e"  # Orange
-                    fmt = "^"          # Triangle
-                    label_str = "Observation - Unresolved"
-                else:
+                    fmt = "D"          # Triangle
+                    label_str = "Observation - dismissed"
+                elif row["validation"] == "verified":
                     colour = "#2ca02c"  # Green
                     fmt = "o"          # Circle
                     label_str = "Observation - Verified"
+                else:
+                    colour = "#666666"  # Green
+                    fmt = "o"          # Circle
+                    label_str = "Observation - Unresolved"
 
                 if row["screening"] == "held":
                     colour = "#8320f3"
@@ -639,16 +687,20 @@ class FlowResolver:
 
                         if row["validation"] == "rejected":
                             colour = "#d62728"  # Red
-                            fmt = "x"
+                            fmt = "X"
                             label_str = "Observation - Rejected (Outlier)"
-                        elif row["validation"] == "unresolved":
+                        elif row["validation"] == "dimissed":
                             colour = "#ff7f0e"  # Orange
-                            fmt = "^"          # Triangle
-                            label_str = "Observation - Unresolved"
-                        else:
+                            fmt = "D"          # Triangle
+                            label_str = "Observation - dismissed"
+                        elif row["validation"] == "verified":
                             colour = "#2ca02c"  # Green
                             fmt = "o"          # Circle
                             label_str = "Observation - Verified"
+                        else:
+                            colour = "#666666"  # Green
+                            fmt = "o"          # Circle
+                            label_str = "Observation - Unresolved"
 
                         if row["screening"] == "held":
                             colour = "#8320f3"
@@ -678,16 +730,20 @@ class FlowResolver:
                         
                         if row["validation"] == "rejected":
                             colour = "#d62728"  # Red
-                            fmt = "x"
+                            fmt = "X"
                             label_str = "Observation - Rejected (Outlier)"
-                        elif row["validation"] == "unresolved":
+                        elif row["validation"] == "dimissed":
                             colour = "#ff7f0e"  # Orange
-                            fmt = "^"          # Triangle
-                            label_str = "Observation - Unresolved"
-                        else:
+                            fmt = "D"          # Triangle
+                            label_str = "Observation - dismissed"
+                        elif row["validation"] == "verified":
                             colour = "#2ca02c"  # Green
                             fmt = "o"          # Circle
                             label_str = "Observation - Verified"
+                        else:
+                            colour = "#666666"  # Green
+                            fmt = "o"          # Circle
+                            label_str = "Observation - Unresolved"
 
                         if row["screening"] == "held":
                             colour = "#8320f3"

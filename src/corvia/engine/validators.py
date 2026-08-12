@@ -121,9 +121,9 @@ class BaseValidator(ABC):
             Indices of observations that do not conform (rejected).
         """
         severity = self.severity_score(store, obs_indices)
-        conforming = severity[severity.abs() <= 1.0].index
-        anomalies = severity[severity.abs() > 1.0].index
-        return conforming, anomalies
+        idx_pass = severity[severity.abs() <= 1.0].index
+        idx_fail = severity[severity.abs() > 1.0].index
+        return idx_pass, idx_fail
 
     @staticmethod
     def _calc_weighted_mean_and_std(flow_df: pd.DataFrame, median_mixing_fraction: float = 0.) -> pd.Series:
@@ -144,7 +144,7 @@ class BaseValidator(ABC):
         raw_mad = np.median(np.abs(volumes - median))
 
         # Bias-correct so MAD is a consistent estimator of std, especially at small n
-        c_n = BaseValidator._MAD_CORRECTION_FACTORS.get(n, BaseValidator._MAD_ASYMPTOTIC_FACTOR)
+        c_n = BaseValidator._MAD_CORRECTION_FACTORS.get(n, 1.) * BaseValidator._MAD_ASYMPTOTIC_FACTOR
         mad = raw_mad * c_n
 
         # Poisson-like counting-noise floor, scaled by volume magnitude.
@@ -154,7 +154,7 @@ class BaseValidator(ABC):
         return pd.Series({"baseline" : median, "baseline_error": mad, "n_effective": n})
 
 
-class StatisticalValidator(BaseValidator):
+class StatisticalRejector(BaseValidator):
     """
     Abstract base class for validators that use a statistical test to compare
     observations against a baseline. Subclasses should implement the p-value 
@@ -169,8 +169,12 @@ class StatisticalValidator(BaseValidator):
         self._two_tailed = two_tailed
 
     def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
-        p_values, directions = self.p_value(store, obs_indices)
-        directions = np.where(directions < 0, -1, 1)
+        p_values, z_sign = self.p_value(store, obs_indices)
+        if self._two_tailed:
+            directions = np.where(z_sign < 0, -1, 1)
+        else:
+            directions = np.ones_like(p_values, dtype="float64")
+
         # Compute log10 safely only where p > 0
         with np.errstate(divide='ignore'):
             return directions * -np.log10(p_values) / -np.log10(self._significance_level)
@@ -179,9 +183,9 @@ class StatisticalValidator(BaseValidator):
     def p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.series]:
         pass
 
-class ZScoreValidator(StatisticalValidator):
+class ZScoreRejector(StatisticalRejector):
     """
-    Standard Z-Score validation comparing observations to a weighted baseline mean.
+    Standard Z-Score rejection test comparing observations to a weighted baseline mean.
     """
     def __init__(
         self, 
@@ -226,16 +230,15 @@ class ZScoreValidator(StatisticalValidator):
     def p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.Series]:
         z_scores = self.compute_z_scores(store, obs_indices)
         p_values = 2 * stats.norm.sf(z_scores.abs()) if self._two_tailed else stats.norm.sf(z_scores)
-        p_values = pd.Series(p_values, index=z_scores.index)
-        return p_values, pd.Series(z_scores/z_scores.abs(), index=z_scores.index)
+        return pd.Series(p_values, index=z_scores.index), pd.Series(z_scores/z_scores.abs(), index=z_scores.index)
 
     def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
         return self._calc_weighted_mean_and_std(group, median_mixing_fraction=self._median_mixing_fraction)
 
 
-class ZScoreModifiedValidator(ZScoreValidator):
+class ZScoreModifiedRejector(ZScoreRejector):
     """
-    Modified Z-Score validation using Median and Median Absolute Deviation (MAD).
+    Modified Z-Score rejection test using Median and Median Absolute Deviation (MAD).
     """
     def __init__(
         self, 
@@ -257,9 +260,10 @@ class ZScoreModifiedValidator(ZScoreValidator):
         return self._calc_median_and_mad(group, poisson_floor_factor=self._poisson_floor_factor)
 
 
-class TScoreValidator(ZScoreValidator):
+class TScoreRejector(ZScoreRejector):
     """
-    Modified Z-Score validation using Median and Median Absolute Deviation (MAD).
+    T-distribution rejection test, using the effective sample size of the
+    surviving reconstruction pool for the degrees of freedom.
     """  
 
     def p_value(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
@@ -296,13 +300,19 @@ class TScoreValidator(ZScoreValidator):
 class RelativeErrorValidator(BaseValidator):
     """
     Validation based on relative percentage difference from consensus baseline mean.
+
+    Role-agnostic: this is a symmetric margin test (|obs - baseline| vs. a
+    relative threshold), which is a sound basis for either a Rejector
+    (loose margin, catches gross outliers) or an Acceptor (tight margin,
+    gates calibration-quality data) — unlike the z/t-score sameness tests,
+    it does not need a separate equivalence-test formulation for acceptance use.
     """
-    def __init__(self, max_percent_deviation: float = 2.0, use_median: bool = True, use_errors: bool = True):
+    def __init__(self, max_percent_deviation: float = 2.0, noise_floor: float = 10., use_median: bool = True, use_errors: bool = True):
         # Max allowed deviation (e.g. 30%)
         self._limit = max_percent_deviation / 100.0
         self._use_median = use_median
         self._use_errors = use_errors
-        self._noise_floor = 10.
+        self._noise_floor = noise_floor
 
     def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
         df = store.dataframe
@@ -315,15 +325,15 @@ class RelativeErrorValidator(BaseValidator):
         baseline = self._broadcast_baseline(lookup_map, obs_rows)
         
         # B. Check relative differences
-        diff_abs = (obs_rows["volume"] - baseline).abs()  
+        diff_abs = (obs_rows["volume"] - baseline["baseline"]).abs()  
         if self._use_errors and "volume_err" in obs_rows.columns:
-            safe_err = obs_rows["volume_err"].fillna(0)
-            diff_abs = (diff_abs - safe_err).clip(lower=0.)
+            safe_err2 = (obs_rows["volume_err"].fillna(0))**2 + (baseline["baseline_error"].fillna(0))**2
+            diff_abs = (diff_abs - np.sqrt(safe_err2)).clip(lower=0.)
 
         # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold.
         # diff_abs is already non-negative, so this ratio is an unsigned severity —
         # fine for magnitude-based ranking, it just carries no over/under direction.
-        limit_val = (baseline * self._limit).clip(lower=self._noise_floor)
+        limit_val = (baseline["baseline"] * self._limit).clip(lower=self._noise_floor)
         return diff_abs / limit_val
     
     def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
