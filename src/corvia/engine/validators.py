@@ -1,7 +1,9 @@
 # corvia/engine/validators.py
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Tuple, TYPE_CHECKING
+from typing import Tuple, Optional, TYPE_CHECKING
+import copy
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -19,6 +21,32 @@ class BaseValidator(ABC):
         6: 1.140, 7: 1.129, 8: 1.107, 9: 1.093,
     }
     _MAD_ASYMPTOTIC_FACTOR = 1.4826
+    _SE_MEDIAN_FACTOR = np.sqrt(np.pi / 2)
+
+    def run_as_rejector(self) -> BaseValidator:
+        """
+        Configures this validator for use as a Rejector. Most validators are
+        Rejector-shaped by default (self-computed baseline, no resolved-output
+        dependency), so the base implementation is a no-op. Override to raise
+        if a subclass's statistics are only valid as an Acceptor.
+
+        Returns a copy of self, for inline chaining at construction/wiring time.
+        """
+        return copy.copy(self)
+
+    def run_as_acceptor(self, baseline_source_id: Optional[str] = None) -> BaseValidator:
+        """
+        Configures this validator for use as an Acceptor. Unlike
+        run_as_rejector, this raises by default — most validators are 
+        NOT statistically sound as Acceptors; only classes that override 
+        this method to reconfigure themselves appropriately support the role.
+        """
+        raise TypeError(
+            f"{type(self).__name__} cannot be used as an Acceptor. Its test "
+            f"structure is only statistically valid for rejection (failing to "
+            f"reject 'obs = baseline' is absence of evidence against the "
+            f"observation, not positive evidence it's trustworthy)."
+        )
 
     @abstractmethod
     def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
@@ -312,15 +340,27 @@ class RelativeErrorValidator(BaseValidator):
         max_percent_deviation: float = 2.0, 
         noise_floor: float = 10., 
         use_median: bool = False, 
-        use_errors: bool = True,
-        use_resolved_baseline: bool = False
+        use_errors: bool = True
     ):
         # Max allowed deviation (e.g. 30%)
         self._limit = max_percent_deviation / 100.0
         self._use_median = use_median
         self._use_errors = use_errors
         self._noise_floor = noise_floor
-        self._use_resolved_baseline = use_resolved_baseline
+        self._use_resolved_baseline = False
+        self._baseline_source_id = None
+
+    def run_as_rejector(self) -> RelativeErrorValidator:
+        new = copy.copy(self)
+        new._use_resolved_baseline = False
+        new._baseline_source_id = None
+        return new
+
+    def run_as_acceptor(self, baseline_source_id: Optional[str] = None) -> RelativeErrorValidator:
+        new = copy.copy(self)
+        new._use_resolved_baseline = True
+        new._baseline_source_id = baseline_source_id
+        return new
 
     def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
         obs_rows = store.dataframe.loc[obs_indices]
@@ -328,7 +368,7 @@ class RelativeErrorValidator(BaseValidator):
         # A. Compute baselines
         baseline = None
         if self._use_resolved_baseline:
-            baseline = store.lookup_resolved_baseline(obs_rows)
+            baseline = store.lookup_resolved_baseline(obs_rows, source_id=self._baseline_source_id)
             if baseline["baseline"].isna().any():
                 n_missing = int(baseline["baseline"].isna().sum())
                 print(
@@ -356,8 +396,121 @@ class RelativeErrorValidator(BaseValidator):
         # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold.
         # diff_abs is already non-negative, so this ratio is an unsigned severity —
         # fine for magnitude-based ranking, it just carries no over/under direction.
-        limit_val = (baseline["baseline"] * self._limit).clip(lower=self._noise_floor)
+        limit_val = (baseline["baseline"].abs() * self._limit).clip(lower=self._noise_floor)
         return diff_abs / limit_val
     
     def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
         return self._calc_median_and_mad(group) if self._use_median else self._calc_weighted_mean_and_std(group)
+
+class RelativeMarginAcceptor(BaseValidator):
+    """
+    TOST (Two One-Sided Tests) equivalence test against a relative margin.
+ 
+    Tests two one-sided hypotheses:
+        H0_1: true (obs - baseline) <= -margin   (obs meaningfully lower)
+        H0_2: true (obs - baseline) >=  margin   (obs meaningfully higher)
+
+    Both must be rejected to declare equivalence — unlike a two-tailed
+    sameness test, this requires positive statistical evidence that the
+    true difference lies inside (-margin, +margin), not merely an absence
+    of evidence against equality. This is the statistically correct
+    structure for an Acceptor (as opposed to reusing a sameness test like
+    ZScoreRejector with a tighter significance level).
+    """
+ 
+    def __init__(
+        self,
+        significance_level: float = 0.05,
+        max_percent_deviation: float = 2.0,
+        noise_floor: float = 10.0,
+        use_errors: bool = True,
+    ):
+        self._significance_level = significance_level
+        self._limit = max_percent_deviation / 100.0
+        self._noise_floor = noise_floor
+        self._use_errors = use_errors
+        self._baseline_source_id = None
+
+    def run_as_rejector(self) -> "RelativeMarginAcceptor":
+        raise TypeError(
+            "RelativeMarginAcceptor cannot be used as a Rejector: Its TOST "
+            "equivalence test answers 'is this close enough to trust', not "
+            "'is this a statistical outlier'."
+        )
+
+    def run_as_acceptor(self, baseline_source_id: Optional[str] = None) -> "RelativeMarginAcceptor":
+        new = copy.copy(self)
+        new._baseline_source_id = baseline_source_id
+        return new
+
+    def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
+        p1, p2 = self.equivalence_p_value(store, obs_indices)
+        p_max = np.maximum(p1, p2)
+    
+        # Log-transform the complementary quantity so severity shrinks
+        # toward 0 as equivalence gets stronger (p_max -> 0) and grows past
+        # 1 as equivalence fails to be established (p_max -> 1), matching
+        # the framework-wide -log10(x)/-log10(y) severity convention while
+        # preserving severity <= 1.0 <=> p_max <= significance_level.
+        with np.errstate(divide='ignore'):
+            severity = (
+                -np.log10(1.0 - p_max) / -np.log10(1.0 - self._significance_level)
+            )
+        return severity.astype("float32")
+ 
+    def equivalence_p_value(self, store: FlowStore, obs_indices: pd.Index) -> Tuple[pd.Series, pd.Series]:
+        """
+        Computes the two one-sided p-values for the TOST equivalence test.
+ 
+        Returns
+        -------
+        p1, p2 : pd.Series, pd.Series
+            p1 tests H0_1 (true diff <= -margin, obs meaningfully lower).
+            p2 tests H0_2 (true diff >=  margin, obs meaningfully higher).
+            Both aligned to obs_indices. NaN where no baseline exists.
+        """
+        df = store.dataframe
+        obs_rows = df.loc[obs_indices]
+ 
+        # A. Compute baselines
+        baseline = store.lookup_resolved_baseline(obs_rows, source_id=self._baseline_source_id)
+        if baseline["baseline"].isna().any():
+            n_missing = int(baseline["baseline"].isna().sum())
+            print(
+                f"WARNING: {n_missing}/{len(obs_indices)} observations have no published "
+                f"resolved baseline yet — falling back to a self-computed baseline for the "
+                f"ENTIRE batch of {len(obs_indices)} observations this call, not just the "
+                f"missing ones, to keep severities comparable within this call."
+            )
+            baseline = None
+
+        if baseline is None:
+            lookup_map = self.compute_baseline(store.dataframe)
+            if lookup_map.empty:
+                return pd.Series(np.nan, index=obs_indices, dtype="float32")
+            baseline = self._broadcast_baseline(lookup_map, obs_rows)
+ 
+        # B. Calculate the p-value of both hypotheses
+        diff = obs_rows["volume"] - baseline["baseline"]
+        if self._use_errors and "volume_err" in obs_rows.columns:
+            obs_err = obs_rows["volume_err"].fillna(0.)
+        else:
+            obs_err = obs_rows["volume"] * 0.
+ 
+        se = np.sqrt(obs_err**2 + baseline["baseline_error"]**2)
+        se = se.replace(0, np.nan).fillna(1e-15)
+ 
+        margin = (baseline["baseline"].abs() * self._limit).clip(lower=self._noise_floor)
+ 
+        # H0_1: true diff <= -margin  (rejected when obs is convincingly ABOVE -margin)
+        t1 = (diff + margin) / se
+        p1 = pd.Series(stats.norm.sf(t1), index=t1.index)
+ 
+        # H0_2: true diff >= +margin  (rejected when obs is convincingly BELOW +margin)
+        t2 = (diff - margin) / se
+        p2 = pd.Series(stats.norm.cdf(t2), index=t2.index)
+ 
+        return p1, p2
+ 
+    def _aggregate_group(self, group: pd.DataFrame) -> pd.Series:
+        return self._calc_weighted_mean_and_std(group)

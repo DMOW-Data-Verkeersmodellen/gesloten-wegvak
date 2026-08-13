@@ -46,11 +46,13 @@ class FlowResolver:
         ...
         """
         
-        self.reconstructors = reconstructors
-        self.rejector = rejector
-        self.acceptor = acceptor
-        self.max_iterations = max_iterations
         self.name = name
+        self._source_id = f"{self.__class__.__name__}-baseline"
+        self.reconstructors = reconstructors
+        self.rejector = rejector.run_as_rejector()
+        self.acceptor = acceptor.run_as_acceptor(baseline_source_id=self._source_id) if acceptor is not None else None
+        self.max_iterations = max_iterations
+
         self.debug_plot = debug_plot
         self.plot_dir = plot_dir
         self.set_plotting_restrictions()
@@ -135,7 +137,7 @@ class FlowResolver:
             for vt in active_vtypes:
                 final_iteration[vt] = iteration
                 done, converged = self._run_vtype_pass(
-                    store, df, vt, iteration,
+                    store, df, vt, periods, iteration,
                     prev_deferred_indices, adaptive_multiplier, snapshots,
                 )
                 resolver_done[vt] = done
@@ -155,28 +157,9 @@ class FlowResolver:
         # Only publish resolved baselines for vtypes that actually converged.
         converged_vtypes = {vt for vt, ok in resolver_converged.items() if ok}
         not_converged_vtypes = [vt for vt in vehicle_types if vt not in converged_vtypes]
-
         print(f"[{periods[0]}] Resolver summary:")
         print(f"    Converged (resolved output refreshed): {sorted(converged_vtypes) or 'none'}")
         print(f"    Not converged (resolved output left as-is, if any exists): {sorted(not_converged_vtypes) or 'none'}")
-        
-        if converged_vtypes:
-            source_id = f"{self.__class__.__name__}-baseline"
-            store.clear_resolved(vehicle_types=list(converged_vtypes), periods=periods, source_id=source_id)
-
-            lookup_map = self.rejector.compute_baseline(store.dataframe.copy())
-            if not lookup_map.empty:
-                resolved_df = (
-                    lookup_map.reset_index()
-                    .rename(columns={"baseline": "volume", "baseline_error": "volume_err"})
-                )
-                resolved_df = resolved_df[resolved_df["vehicle_type"].isin(converged_vtypes)]
-                if not resolved_df.empty:
-                    resolved_df["source_type"] = FlowStore.SOURCE_RES
-                    resolved_df["source_id"] = source_id
-                    resolved_df["validation"] = "NA"
-                    resolved_df["weight"] = 1.0
-                    store.append_estimates(resolved_df)
     
         if self.debug_plot:
             for vt in vehicle_types:
@@ -190,6 +173,7 @@ class FlowResolver:
         store: FlowStore,
         df: pd.DataFrame,
         vt: str,
+        periods: List[pd.Timestamp],
         iteration: int,
         prev_deferred_indices: dict,
         adaptive_multiplier: dict,
@@ -288,7 +272,8 @@ class FlowResolver:
         if len(idx_rejected) == 0:
             print(f"--> Architecture converged cleanly for {vt} at iteration {iteration}")
             #print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
-            self._run_acceptor_for_vtype(store, vt)
+            if self._publish_resolved_for_vtype(store, vt, periods):
+                self._run_acceptor_for_vtype(store, vt, periods)
             return True, True
 
         if self.greedy_elimination:
@@ -331,13 +316,14 @@ class FlowResolver:
                 print(f"--> Convergence for {vt} reached at iteration {iteration}: Validation states have stabilized.")
             else:
                 print(f"--> Convergence for {vt} stopped at iteration {iteration}: Detected an oscillation cycle (matches iteration {duplicate_iteration}).")
-            self._run_acceptor_for_vtype(store, vt)
+            if self._publish_resolved_for_vtype(store, vt, periods):
+                self._run_acceptor_for_vtype(store, vt, periods)
             return True, True
         
         print(f"--> No convergence found for {vt}, outliers over threshold: {list(idx_rejected_ranked)}")
         return False, False
     
-    def _run_acceptor_for_vtype(self, store: FlowStore, vt: str) -> None:
+    def _run_acceptor_for_vtype(self, store: FlowStore, vt: str, periods: List[pd.Timestamp]) -> None:
         """
         Runs self.acceptor (a BaseValidator) once for a vehicle type whose
         Rejector pass just converged. Relabels every currently "conforming"
@@ -374,7 +360,32 @@ class FlowResolver:
             f"      dismissed:  {int(final_counts.get('dismissed', 0)):>6}\n"
             f"      unresolved: {int(final_counts.get('unresolved', 0)):>6}"
         )
-        
+
+    def _publish_resolved_for_vtype(self, store: FlowStore, vt: str, periods: List[pd.Timestamp]) -> bool:
+        """
+        Computes and publishes (SOURCE_RES) the Rejector's baseline for this
+        vehicle type/period, replacing any prior resolved output at the same
+        coordinates from this resolver. Returns True if a baseline was
+        actually published.
+        """
+        store.clear_resolved(vehicle_types=[vt], periods=periods, source_id=self._source_id)
+
+        lookup_map = self.rejector.compute_baseline(store.dataframe.copy())
+        resolved_df = (
+            lookup_map.reset_index()
+            .rename(columns={"baseline": "volume", "baseline_error": "volume_err"})
+        )
+        resolved_df = resolved_df[resolved_df["vehicle_type"] == vt]
+        if resolved_df.empty:
+            print(f"WARNING: [{vt}] No reconstruction traces available — nothing to publish, skipping acceptor.")
+            return False
+
+        resolved_df["source_type"] = FlowStore.SOURCE_RES
+        resolved_df["source_id"] = self._source_id
+        resolved_df["validation"] = "NA"
+        resolved_df["weight"] = 1.0
+        store.append_estimates(resolved_df)
+        return True
 
     def set_plotting_restrictions(self, 
             sections_to_plot: Optional[List[str]] = None,
