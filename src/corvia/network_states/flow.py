@@ -336,3 +336,51 @@ class FlowStore():
         w = sub["weight"].to_numpy(dtype="float64")
 
         return utils.weighted_mean_and_error(v, e, w, label="consensus"+road_section_id)
+
+    def lookup_resolved_baseline(
+        self,
+        target_rows: pd.DataFrame,
+        source_id: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Looks up the already-published SOURCE_RES value for each target row's
+        (road_section_id, timestamp, vehicle_type) coordinate.
+
+        Unlike section_consensus() (which blends multiple contributing rows via
+        a weighted mean), this returns the exact SOURCE_RES row already sitting
+        in the store — useful when a caller wants to test against the specific
+        value that was actually published, rather than recomputing an aggregate.
+
+        Parameters
+        ----------
+        target_rows : pd.DataFrame
+            Must contain columns ["road_section_id", "timestamp", "vehicle_type"].
+        source_id : str, optional
+            If given, only matches SOURCE_RES rows with this source_id — so a
+            lookup doesn't accidentally pick up another resolver's published
+            output for the same coordinate. If None, matches any SOURCE_RES row.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns ["baseline", "baseline_error"], aligned to target_rows.index.
+            NaN where no SOURCE_RES row exists yet for that coordinate.
+        """
+        mask = self._df["source_type"] == self.SOURCE_RES
+        if source_id is not None:
+            mask &= self._df["source_id"] == source_id
+        resolved = self._df[mask]
+        if resolved.empty:
+            return pd.DataFrame(np.nan, index=target_rows.index, columns=["baseline", "baseline_error"])
+
+        lookup_map = (
+            resolved[["road_section_id", "timestamp", "vehicle_type", "volume", "volume_err"]]
+            .rename(columns={"volume": "baseline", "volume_err": "baseline_error"})
+        )
+        obs_coords = target_rows[["road_section_id", "timestamp", "vehicle_type"]].reset_index()
+        baseline = obs_coords.merge(
+            lookup_map,
+            on=["road_section_id", "timestamp", "vehicle_type"],
+            how="left"
+        ).set_index("index")[["baseline", "baseline_error"]]
+        return baseline

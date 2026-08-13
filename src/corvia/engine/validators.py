@@ -307,28 +307,50 @@ class RelativeErrorValidator(BaseValidator):
     gates calibration-quality data) — unlike the z/t-score sameness tests,
     it does not need a separate equivalence-test formulation for acceptance use.
     """
-    def __init__(self, max_percent_deviation: float = 2.0, noise_floor: float = 10., use_median: bool = True, use_errors: bool = True):
+    def __init__(self, 
+        max_percent_deviation: float = 2.0, 
+        noise_floor: float = 10., 
+        use_median: bool = False, 
+        use_errors: bool = True,
+        use_resolved_baseline: bool = False
+    ):
         # Max allowed deviation (e.g. 30%)
         self._limit = max_percent_deviation / 100.0
         self._use_median = use_median
         self._use_errors = use_errors
         self._noise_floor = noise_floor
+        self._use_resolved_baseline = use_resolved_baseline
 
     def severity_score(self, store: FlowStore, obs_indices: pd.Index) -> pd.Series:
-        df = store.dataframe
-        obs_rows = df.loc[obs_indices]
+        obs_rows = store.dataframe.loc[obs_indices]
         
         # A. Compute baselines
-        lookup_map = self.compute_baseline(df)
-        if lookup_map.empty:
-            return pd.Series(np.nan, index=obs_indices, dtype="float32")
-        baseline = self._broadcast_baseline(lookup_map, obs_rows)
+        baseline = None
+        if self._use_resolved_baseline:
+            baseline = store.lookup_resolved_baseline(obs_rows)
+            if baseline["baseline"].isna().any():
+                n_missing = int(baseline["baseline"].isna().sum())
+                print(
+                    f"WARNING: {n_missing}/{len(obs_indices)} observations have no published "
+                    f"resolved baseline yet — falling back to a self-computed baseline for the "
+                    f"ENTIRE batch of {len(obs_indices)} observations this call, not just the "
+                    f"missing ones, to keep severities comparable within this call."
+                )
+                baseline = None
+
+        if baseline is None:
+            lookup_map = self.compute_baseline(store.dataframe)
+            if lookup_map.empty:
+                return pd.Series(np.nan, index=obs_indices, dtype="float32")
+            baseline = self._broadcast_baseline(lookup_map, obs_rows)
         
         # B. Check relative differences
-        diff_abs = (obs_rows["volume"] - baseline["baseline"]).abs()  
+        diff_abs_raw = (obs_rows["volume"] - baseline["baseline"]).abs()
         if self._use_errors and "volume_err" in obs_rows.columns:
             safe_err2 = (obs_rows["volume_err"].fillna(0))**2 + (baseline["baseline_error"].fillna(0))**2
-            diff_abs = (diff_abs - np.sqrt(safe_err2)).clip(lower=0.)
+        else:
+            safe_err2 = pd.Series(0., index=obs_rows.index)
+        diff_abs = (diff_abs_raw - np.sqrt(safe_err2)).clip(lower=0.)
 
         # C. Normalize so |severity| > 1.0 <=> anomalous at this validator's threshold.
         # diff_abs is already non-negative, so this ratio is an unsigned severity —
