@@ -154,6 +154,12 @@ class FlowResolver:
     
         # Only publish resolved baselines for vtypes that actually converged.
         converged_vtypes = {vt for vt, ok in resolver_converged.items() if ok}
+        not_converged_vtypes = [vt for vt in vehicle_types if vt not in converged_vtypes]
+
+        print(f"[{periods[0]}] Resolver summary:")
+        print(f"    Converged (resolved output refreshed): {sorted(converged_vtypes) or 'none'}")
+        print(f"    Not converged (resolved output left as-is, if any exists): {sorted(not_converged_vtypes) or 'none'}")
+        
         if converged_vtypes:
             source_id = f"{self.__class__.__name__}-baseline"
             store.clear_resolved(vehicle_types=list(converged_vtypes), periods=periods, source_id=source_id)
@@ -281,7 +287,7 @@ class FlowResolver:
 
         if len(idx_rejected) == 0:
             print(f"--> Architecture converged cleanly for {vt} at iteration {iteration}")
-            print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
+            #print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
             self._run_acceptor_for_vtype(store, vt)
             return True, True
 
@@ -346,16 +352,29 @@ class FlowResolver:
             & (store.dataframe["validation"] == "conforming")
         )
         conforming_idx = store.dataframe[conforming_mask].index
+
         if conforming_idx.empty:
-            return
-
-        if self.acceptor is None:
+            pass
+        elif self.acceptor is None:
+            print("--> No acceptor given, verifying all 'conforming' observations")
             store.set_validation_state(conforming_idx, "verified")
-            return
+        else:
+            verified_idx, dismissed_idx = self.acceptor.validate(store, conforming_idx)
+            store.set_validation_state(verified_idx, "verified")
+            store.set_validation_state(dismissed_idx, "dismissed")
 
-        verified_idx, dismissed_idx = self.acceptor.validate(store, conforming_idx)
-        store.set_validation_state(verified_idx, "verified")
-        store.set_validation_state(dismissed_idx, "dismissed")
+        final_counts = store.dataframe[
+            (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
+            & (store.dataframe["vehicle_type"] == vt)
+        ]["validation"].value_counts()
+        print(
+            f"--> Final tally {vt}:\n"
+            f"      rejected:   {int(final_counts.get('rejected', 0)):>6}\n"
+            f"      verified:   {int(final_counts.get('verified', 0)):>6}\n"
+            f"      dismissed:  {int(final_counts.get('dismissed', 0)):>6}\n"
+            f"      unresolved: {int(final_counts.get('unresolved', 0)):>6}"
+        )
+        
 
     def set_plotting_restrictions(self, 
             sections_to_plot: Optional[List[str]] = None,
