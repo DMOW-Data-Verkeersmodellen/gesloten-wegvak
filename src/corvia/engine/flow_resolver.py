@@ -481,10 +481,10 @@ class FlowResolver:
                     colour = "#d62728"  # Red
                     fmt = "X"
                     label_str = "Observation - Rejected (Outlier)"
-                elif row["validation"] == "dimissed":
+                elif row["validation"] == "dismissed":
                     colour = "#ff7f0e"  # Orange
                     fmt = "D"          # Triangle
-                    label_str = "Observation - dismissed"
+                    label_str = "Observation - Dismissed"
                 elif row["validation"] == "verified":
                     colour = "#2ca02c"  # Green
                     fmt = "o"          # Circle
@@ -519,10 +519,10 @@ class FlowResolver:
                     colour = "#d62728"  # Red
                     fmt = "X"
                     label_str = "Observation - Rejected (Outlier)"
-                elif row["validation"] == "dimissed":
+                elif row["validation"] == "dismissed":
                     colour = "#ff7f0e"  # Orange
                     fmt = "D"          # Triangle
-                    label_str = "Observation - dismissed"
+                    label_str = "Observation - Dismissed"
                 elif row["validation"] == "verified":
                     colour = "#2ca02c"  # Green
                     fmt = "o"          # Circle
@@ -720,10 +720,10 @@ class FlowResolver:
                             colour = "#d62728"  # Red
                             fmt = "X"
                             label_str = "Observation - Rejected (Outlier)"
-                        elif row["validation"] == "dimissed":
+                        elif row["validation"] == "dismissed":
                             colour = "#ff7f0e"  # Orange
                             fmt = "D"          # Triangle
-                            label_str = "Observation - dismissed"
+                            label_str = "Observation - Dismissed"
                         elif row["validation"] == "verified":
                             colour = "#2ca02c"  # Green
                             fmt = "o"          # Circle
@@ -763,10 +763,10 @@ class FlowResolver:
                             colour = "#d62728"  # Red
                             fmt = "X"
                             label_str = "Observation - Rejected (Outlier)"
-                        elif row["validation"] == "dimissed":
+                        elif row["validation"] == "dismissed":
                             colour = "#ff7f0e"  # Orange
                             fmt = "D"          # Triangle
-                            label_str = "Observation - dismissed"
+                            label_str = "Observation - Dismissed"
                         elif row["validation"] == "verified":
                             colour = "#2ca02c"  # Green
                             fmt = "o"          # Circle

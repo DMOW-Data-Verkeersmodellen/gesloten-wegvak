@@ -106,7 +106,7 @@ class FlowStore():
         return self._vehicle_types
 
     def set_validation_state(self, indices: pd.Index | list | np.array, state: str) -> None:
-        """Sets the dynamic validation state ('verified', 'unresolved', 'rejected', 'pending') for given indices."""
+        """Sets the dynamic validation state for given indices. See FlowStore.VALIDATION_STATES for the allowed values."""
         if state not in self.VALIDATION_STATES:
             raise ValueError(f"Invalid validation state: '{state}'. Must be one of {self.VALIDATION_STATES}")
         indices = pd.Index(indices)

@@ -141,17 +141,18 @@ class BaseValidator(ABC):
         n = len(volumes)
 
         median = np.median(volumes)
-        raw_mad = np.median(np.abs(volumes - median))
+        mad = np.median(np.abs(volumes - median))
 
         # Bias-correct so MAD is a consistent estimator of std, especially at small n
         c_n = BaseValidator._MAD_CORRECTION_FACTORS.get(n, 1.) * BaseValidator._MAD_ASYMPTOTIC_FACTOR
-        mad = raw_mad * c_n
+        std_estimate = mad * c_n
 
         # Poisson-like counting-noise floor, scaled by volume magnitude.
         poisson_floor = poisson_floor_factor * np.sqrt(max(median, 1.0))
-        mad = max(mad, poisson_floor)
+        std_estimate = max(std_estimate, poisson_floor)
+        median_error = BaseValidator._SE_MEDIAN_FACTOR * std_estimate / np.sqrt(max(n, 1))
 
-        return pd.Series({"baseline" : median, "baseline_error": mad, "n_effective": n})
+        return pd.Series({"baseline" : median, "baseline_error": median_error, "n_effective": n})
 
 
 class StatisticalRejector(BaseValidator):
