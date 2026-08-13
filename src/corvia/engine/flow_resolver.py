@@ -96,6 +96,15 @@ class FlowResolver:
     ) -> FlowStore:
         """Runs adaptive iterations per vehicle type until each clears or
         stabilizes, then verifies or dismisses data per converged vehicle type."""
+
+        if len(periods) != 1:
+            raise ValueError(
+                "FlowResolver.run() only supports a single timestamp at a time for now "
+                "— convergence is currently tracked per vehicle type but pooled across "
+                "all given periods, so a mixed batch could silently withhold resolved "
+                "output for a clean period just because another period in the same "
+                "call didn't converge. Call run() once per timestamp instead."
+            )
         
         resolver_converged = {vt: False for vt in vehicle_types}
         resolver_done = {vt: False for vt in vehicle_types}
@@ -113,11 +122,11 @@ class FlowResolver:
                 break
 
             print(f"[Pass {iteration}] Generating network estimations...")
-            store.clear_reconstructions()
+            store.clear_reconstructions(vehicle_types=active_vtypes, periods=periods)
             
             # Execute reconstruction engines
             for recon in self.reconstructors:
-                recon_df = recon.reconstruct(network, store, periods, vehicle_types)
+                recon_df = recon.reconstruct(network, store, periods, active_vtypes)
                 if recon_df is not None and not recon_df.empty:
                     store.append_estimates(recon_df)
 
@@ -146,6 +155,9 @@ class FlowResolver:
         # Only publish resolved baselines for vtypes that actually converged.
         converged_vtypes = {vt for vt, ok in resolver_converged.items() if ok}
         if converged_vtypes:
+            source_id = f"{self.__class__.__name__}-baseline"
+            store.clear_resolved(vehicle_types=list(converged_vtypes), periods=periods, source_id=source_id)
+
             lookup_map = self.rejector.compute_baseline(store.dataframe.copy())
             if not lookup_map.empty:
                 resolved_df = (
@@ -155,7 +167,7 @@ class FlowResolver:
                 resolved_df = resolved_df[resolved_df["vehicle_type"].isin(converged_vtypes)]
                 if not resolved_df.empty:
                     resolved_df["source_type"] = FlowStore.SOURCE_RES
-                    resolved_df["source_id"] = f"{self.__class__.__name__}-baseline"
+                    resolved_df["source_id"] = source_id
                     resolved_df["validation"] = "NA"
                     resolved_df["weight"] = 1.0
                     store.append_estimates(resolved_df)

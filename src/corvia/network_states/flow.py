@@ -113,9 +113,53 @@ class FlowStore():
         if not indices.dropna().empty:
             self._df.loc[indices, "validation"] = state
 
-    def clear_reconstructions(self) -> None:
-        """Purges old reconstruction rows to clean up memory between iterative passes."""
-        self._df = self._df[self._df["source_type"] != self.SOURCE_REC].reset_index(drop=True)
+    def clear_reconstructions(
+        self,
+        vehicle_types: Optional[List[str]] = None,
+        periods: Optional[List[pd.Timestamp]] = None,
+    ) -> None:
+        """Purges reconstruction rows.
+
+        Parameters
+        ----------
+        vehicle_types : list of str, optional
+            If given, only purges reconstruction rows for these vehicle types.
+        periods : list of Timestamp, optional
+            If given, only purges reconstruction rows at these timestamps.
+        """
+        mask = self._df["source_type"] == self.SOURCE_REC
+        if vehicle_types is not None:
+            mask &= self._df["vehicle_type"].isin(vehicle_types)
+        if periods is not None:
+            mask &= self._df["timestamp"].isin(periods)
+        self._df = self._df[~mask].reset_index(drop=True)
+
+    def clear_resolved(
+        self,
+        vehicle_types: Optional[List[str]] = None,
+        periods: Optional[List[pd.Timestamp]] = None,
+        source_id: Optional[str] = None,
+    ) -> None:
+        """
+        Purges existing resolved (SOURCE_RES) rows. 
+
+        Parameters
+        ----------
+        vehicle_types : list of str, optional
+            If given, only purges resolved rows for these vehicle types.
+        periods : list of Timestamp, optional
+            If given, only purges resolved rows at these timestamps.
+        source_id : str, optional
+            If given, only purges resolved rows with this source_id
+        """
+        mask = self._df["source_type"] == self.SOURCE_RES
+        if vehicle_types is not None:
+            mask &= self._df["vehicle_type"].isin(vehicle_types)
+        if periods is not None:
+            mask &= self._df["timestamp"].isin(periods)
+        if source_id is not None:
+            mask &= self._df["source_id"] == source_id
+        self._df = self._df[~mask].reset_index(drop=True)
 
     def append_estimates(self, df_to_append: pd.DataFrame) -> None:
         """
