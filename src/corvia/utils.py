@@ -6,7 +6,7 @@ import pandas as pd
 @staticmethod
 def weighted_mean_and_error(
     values_arr, 
-    errors_arr, 
+    errors_arr=None, 
     weights_arr=None, 
     label: Optional[str] = None,
     return_n_effective: bool = False
@@ -30,61 +30,55 @@ def weighted_mean_and_error(
         A tuple containing the weighted mean and its error.
     """
     values = np.asarray(values_arr, dtype=np.float64)
-    errors = np.asarray(errors_arr, dtype=np.float64)
-    if weights_arr is None:
-        weights = np.ones_like(values)
-    else:
-        weights = np.asarray(weights_arr, dtype=np.float64)
+    errors = np.asarray(errors_arr, dtype=np.float64) if errors_arr is not None else np.full_like(values, np.nan)
+    weights = np.asarray(weights_arr, dtype=np.float64) if weights_arr is not None else np.ones_like(values)
 
-    # Ensure that all arrays have the same length
     if not (len(values) == len(errors) == len(weights)):
         raise ValueError("All input arrays must have the same length.")
     
-    #Filter out invalid value entries
+    # A. Filter out invalid value entries
     valid_mask = (~np.isnan(values))
-    
-    if not np.any(valid_mask):
+    if valid_mask.sum() == 0:
         return (np.nan, np.nan, np.nan) if return_n_effective else (np.nan, np.nan)
 
     values = values[valid_mask]
     errors = errors[valid_mask]
     weights = weights[valid_mask]
 
+    # B. Validate remaining input
+    if not np.isnan(errors).all() and (np.isnan(errors).any() or np.any(errors <= 0)):
+        raise ValueError("Incorrect volume errors detected: errors should all be positive (> 0) or all be missing (np.nan)")
+    
+    if np.isnan(weights).any() or np.any(weights < 0):
+        raise ValueError("Incorrect weights detected: weights should all be non-negative (>= 0)") 
+
+    # C. Calculate the combined weights considering both the provided weights and the inverse square of errors
+    combined_weights = weights.copy()
+    if not np.isnan(errors).any():
+        combined_weights /= (errors ** 2)
+
+    # SPECIAL CASE: no or one data point
     if len(values) == 1:
-        # If there's only one valid value, return it and its error
         err = errors[0]
-        err = err if (~np.isnan(err) and err > 0) else np.nan
+        err = np.nan if (err <= 0) else err
         return (values[0], err, 1) if return_n_effective else (values[0], err)
     
-    # Check for invalid entries and fall back to the uniform weights/errors if needed
-    has_all_errors = np.all(~np.isnan(errors) & (errors > 0))
-    has_all_weights = np.all(~np.isnan(weights) & (weights >= 0))
-    if not has_all_weights:
-        weights = np.ones_like(values)
-        print(f"Warning ({label}): Missing or negative weights detected. Defaulting to uniform weights.")
-    raw_errors = np.copy(errors)
-    if not has_all_errors:
-        errors = np.ones_like(values)
-        print(f"Warning ({label}): Missing, zero, or negative volume errors detected. Defaulting to uniform errors.")
-
-    # Calculate the combined weights considering both the provided weights and the inverse square of errors
-    combined_weights = weights / (errors ** 2)
     if (combined_weights > 0.).sum() == 0:
         print(f"Warning ({label}): All weights are zero. Returning NaN.")   
         return (np.nan, np.nan, np.nan) if return_n_effective else (np.nan, np.nan)
     if (combined_weights > 0.).sum() == 1:
         print(f"Warning ({label}): Only one non-zero weight. Returning that volume and its error.")
         idx = np.argmax(combined_weights)
-        err = raw_errors[idx]
-        err = err if (~np.isnan(err) and err > 0) else np.nan
+        err = errors[idx]
+        err = np.nan if (err <= 0) else err
         return (values[idx], err, 1.0) if return_n_effective else (values[idx], err)
 
-    # Calculate the weighted mean
+    # D. Calculate the weighted mean
     V1 = combined_weights.sum()
     V2 = (combined_weights**2).sum()
     weighted_mean = np.sum(combined_weights * values) / V1
 
-    # Calculate the error of the weighted mean
+    # E. Calculate the error of the weighted mean
     cochran_weight_correction = (V1**2 - V2) / V1
     weighted_estimated_variance = (combined_weights*(values - weighted_mean)**2).sum() / cochran_weight_correction
 
