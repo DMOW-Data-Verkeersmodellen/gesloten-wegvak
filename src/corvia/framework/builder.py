@@ -274,13 +274,23 @@ class NetworkBuilder:
         
         # 1a. Instantiate nodes from nodes_data
         for n in nodes_data:
-            node = Node(n["node_id"])
-            self._nodes[node.node_id] = node
-            self._node_geometries[node.node_id] = n.get("geometry")
+            nid = n["node_id"]
+            if nid in self._nodes:
+                error_msg = f"Duplicate node_id found in nodes_data: '{nid}'"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            node = Node(nid)
+            self._nodes[nid] = node
+            self._node_geometries[nid] = n.get("geometry")
 
         # 1b. Instantiate links; create any missing nodes on the fly
         implicit_nodes = 0
         for l in links_data:
+            lid = l["link_id"]
+            if lid in self._links:
+                error_msg = f"Duplicate link_id found in links_data: '{lid}'"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
             for nid in (l["start_node"], l["end_node"]):
                 if nid not in self._nodes:
                     self._nodes[nid] = Node(nid)
