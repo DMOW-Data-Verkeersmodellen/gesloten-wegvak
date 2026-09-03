@@ -30,6 +30,8 @@ import geopandas as gpd
 from shapely.geometry.base import BaseGeometry
 
 from corvia.framework.topology import SensorLocation, Link, Node, RoadSection
+from corvia.logger import get_logger
+logger = get_logger(__name__)
 
 
 class Network:
@@ -102,6 +104,13 @@ class Network:
         self._sensors_gdf: gpd.GeoDataFrame = sensors_gdf
         self._layers: Dict[str, gpd.GeoDataFrame] = {}
         self._name: str = name
+        self.logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+        self.logger.info(
+            f"Network '{self._name}' assembled: "
+            f"{len(self._nodes)} node(s), "
+            f"{len(self._links)} link(s), "
+            f"{len(self._sections)} section(s)."
+        )
     # ------------------------------------------------------------------
     # Object-graph registries (snapshots — internal dicts are protected)
     # ------------------------------------------------------------------
@@ -239,6 +248,7 @@ class Network:
             geometry is null.
         """
         if node_id not in self._nodes_gdf.index:
+            self.logger.warning(f"node_geometyr: '{node_id}' not found in nodes_gdf.")
             return None
         geom = self._nodes_gdf.loc[node_id, "geometry"]
         return None if pd.isna(geom) else geom
@@ -256,6 +266,7 @@ class Network:
         shapely.geometry.base.BaseGeometry or None
         """
         if link_id not in self._links_gdf.index:
+            self.logger.warning(f"link_geometyr: '{link_id}' not found in links_gdf.")
             return None
         geom = self._links_gdf.loc[link_id, "geometry"]
         return None if pd.isna(geom) else geom
@@ -273,6 +284,7 @@ class Network:
             shapely.geometry.base.BaseGeometry or None
             """
             if location_id not in self._sensors_gdf.index:
+                self.logger.warning(f"sensor_geometyr: '{location_id}' not found in sensor_gdf.")
                 return None
             geom = self._sensors_gdf.loc[location_id, "geometry"]
             return None if pd.isna(geom) else geom
@@ -283,26 +295,22 @@ class Network:
 
     def add_layer(self, name: str, gdf: gpd.GeoDataFrame) -> None:
         """
-        Register an additional spatial layer on the network.
+        Register an additional new spatial layer on the network.
+        Use :meth:`replace_layer` to overwrite.
 
         Parameters
         ----------
         name : str
             Layer identifier (e.g. ``"zones"``, ``"connectors"``).
         gdf : geopandas.GeoDataFrame
-            The layer to register.
-
-        Raises
-        ------
-        ValueError
-            If a layer with *name* already exists.  Use
-            :meth:`replace_layer` to overwrite.
+            The layer to register. 
         """
         if name in self._layers:
-            raise ValueError(
-                f"Layer '{name}' already exists. Use replace_layer() to overwrite."
-            )
+            error_msg = f"Cannot add layer '{name}' on network '{self._name}': already exists.  "
+            logger.error(error_msg + "Use :meth:`replace_layer` to overwrite existing layers. ")
+            raise ValueError(error_msg)
         self._layers[name] = gdf
+        self.logger.debug(f"Layer '{name}' set on network '{self._name}' ({len(gdf)} rows).")
 
     def replace_layer(self, name: str, gdf: gpd.GeoDataFrame) -> None:
         """
@@ -313,7 +321,10 @@ class Network:
         name : str
         gdf : geopandas.GeoDataFrame
         """
+        if name not in self._layers:
+            logger.warning(f"Layer '{name}' does not exist on network '{self._name}': simply adding new layer. ")
         self._layers[name] = gdf
+        self.logger.debug(f"Layer '{name}' set on network '{self._name}' ({len(gdf)} rows).")
 
     def get_layer(self, name: str) -> Optional[gpd.GeoDataFrame]:
         """

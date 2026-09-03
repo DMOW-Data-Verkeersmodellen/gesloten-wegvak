@@ -30,6 +30,9 @@ import pandas as pd
 
 from corvia.network_states.flow import FlowStore as FlowStore
 
+from corvia.logger import get_logger
+logger = get_logger(__name__)
+
 if TYPE_CHECKING:
     from corvia.framework.network import Network
     from corvia.framework.topology import RoadSection
@@ -40,29 +43,43 @@ class FlowLinkBalancer():
     Reconstruct a section's volume from neighbouring section volumes using
     flow conservation, extended to arbitrary neighbour depth.
 
-    At degree 1 the equation is a simple node flow balance.  At degree 2 each
-    neighbour term is itself expanded one level further.  The recursion
-    continues until ``degree`` levels have been expanded or a base-case
-    (data lookup) is reached.
+    Recursively expands into upstream/downstream neighbour sections, applying
+    the flow balance equations described in the module docstring, until an
+    observation is found on every required branch or the expansion is
+    abandoned as infeasible (missing data, a cycle, or the network edge).
 
     Parameters
     ----------
     direction : str
         ``"upstream"`` to reconstruct from the entry node,
         ``"downstream"`` to reconstruct from the exit node.
-    degree : int, optional
-        Number of neighbour levels to expand.  Defaults to ``1``.
-        Degree 1 uses direct neighbours only; degree 2 uses neighbours of
-        neighbours, etc.
+    min_obs_degree : int, default = 1
+        Minimum number of observations to bypass before accepting one as
+        the base case — forces the recursion past the nearest sensor(s) to
+        average out local effects. Must be >= 1.
+    max_link_degree : int or float, default = 1
+        Maximum neighbour-expansion depth before giving up. Must be >=
+        *min_obs_degree*. ``np.inf`` is coerced to
+        ``PRACTICAL_MAX_DEGREE + 3`` with a warning, to prevent unbounded
+        graph traversal.
     weight : float, optional
-        Override the computed default weight.  When not supplied, weight
-        decays as ``0.9 ** degree`` so that higher-degree reconstructions
-        are automatically trusted less.
+        Override the computed default weight. When not supplied, weight
+        decays as ``_base_weight ** degree_effective`` so that
+        higher-degree reconstructions are automatically trusted less.
+    allow_partial_fallback : bool, default = False
+        If a branch is infeasible partway through expansion but this
+        section's own observation was available, fall back to that
+        observation instead of failing the whole reconstruction.
+
+    Raises
+    ------
+    ValueError
+        If *min_obs_degree* < 1, or *max_link_degree* < *min_obs_degree*.
 
     Examples
     --------
-    >>> m1 = FlowConservationReconstruction("upstream", degree=1)
-    >>> m2 = FlowConservationReconstruction("downstream", degree=2)
+    >>> m1 = FlowLinkBalancer("upstream", min_obs_degree=1, max_link_degree=1)
+    >>> m2 = FlowLinkBalancer("downstream", min_obs_degree=1, max_link_degree=2)
     >>> pipeline.add_method(m1)
     >>> pipeline.add_method(m2)
     """
@@ -79,28 +96,31 @@ class FlowLinkBalancer():
         weight: Optional[float] = None,
         allow_partial_fallback: bool = False,
     ) -> None:
+        self.logger = get_logger(f"{__name__}.{self.__class__.__name__}")
 
         if np.isinf(max_link_degree):
             max_link_degree = self.PRACTICAL_MAX_DEGREE + 3
-            print(
-                "WARNING: "
-                "max_link_degree was set to infinity. Coercing to a maximum safe "
+            self.logger.warning(
+                f"max_link_degree was set to infinity. Coercing to a maximum safe "
                 f"computational depth of {max_link_degree} to prevent network traversal explosions."
             )
         max_link_degree = int(max_link_degree)
 
         if min_obs_degree < 1:
-            raise ValueError(f"min_obs_degree must be >= 1, got {min_obs_degree}.")
+            error_msg = f"Invalid min_obs_degree={min_obs_degree}, must be >= 1."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
         if max_link_degree < min_obs_degree:
-            raise ValueError(f"max_link_degree ({max_link_degree}) must be >= min_obs_degree ({min_obs_degree}).")
-
+            error_msg = f"Invalid max_link_degree={max_link_degree} < min_obs_degree={min_obs_degree}."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+        
         # 2. Issue a warning if the limit is computationally dangerous but allow the user to proceed
         if max_link_degree > self.PRACTICAL_MAX_DEGREE:
-            print(
-                "WARNING: "
+            self.logger.warning(
                 f"Configured max_link_degree={max_link_degree} exceeds the recommended practical limit "
                 f"of {self.PRACTICAL_MAX_DEGREE}. This may result in exponential graph expansion "
-                "slowdowns and a high risk of total reconstruction failure."
+                f"slowdowns and a high risk of total reconstruction failure."
             )
 
         self.direction: str = direction
@@ -135,19 +155,27 @@ class FlowLinkBalancer():
         Parameters
         ----------
         network : Network
-        store : FlowStore
+            The network on which flows need to be balanced
+        flow_data : FlowStore
+            Data store holding the flowvolumes of different
+            sensors connected to links in the network
         periods : list of Timestamp
+            The starting times of the time periods to reconstruct
         vehicle_types : list of str
 
         Returns
         -------
         pd.DataFrame
+            Reconstructed values for sensors in the same
+            format as the dataframe of the FlowStore.
         """
         rows = []
+        attempted = 0
 
         for section in network.sections.values():
             for period in periods:
                 for vtype in vehicle_types:
+                    attempted += 1
                     volume, volume_err, degree_eff = self._estimate(
                         section=section,
                         direction=self.direction,
@@ -165,6 +193,9 @@ class FlowLinkBalancer():
                                 section.section_id, period, vtype, volume, volume_err=volume_err, weight=weight,
                             )
                         )
+        self.logger.info(f"{self.name}: reconstructed {len(rows)}/{attempted} (section, period, vtype) combination(s).")
+        if not rows:
+            self.logger.warning(f"{self.name}: produced no reconstructions this pass.")
 
         return (
             pd.DataFrame(rows, columns=FlowStore.COLUMNS) if rows else self._empty_result()
@@ -195,22 +226,30 @@ class FlowLinkBalancer():
             The section to estimate.
         direction : str
             ``"upstream"`` or ``"downstream"`` — which node to balance at.
-        degree : int
-            Levels of expansion to perform. When 0, a data lookup is
-            performed instead of further expansion.
-        store : ObservationStore
-        period : Timestamp
+        min_obs_degree : int
+            Remaining number of observations to bypass before accepting one
+            as a base case. Decremented only when an observation is actually
+            skipped at this section.
+        max_link_degree : int
+            Remaining neighbour-expansion depth. When <= 0, the expansion is
+            abandoned as infeasible.
+        flow_data : FlowStore
+        period : pd.Timestamp
         vtype : str
         visited : frozenset of str
             Section IDs already on the current call path.  Used for cycle
             detection.  A frozenset is used so each recursive branch carries
             its own independent copy without explicit copying.
+        numb_obs_skipped : int, default = 0
+            Running count of observations bypassed so far on this call path;
+            carried through to compute the effective degree of the eventual
+            base case.
 
         Returns
         -------
         tuple of float : volume, volume_err, effective_degree
             The estimated volume and its error.
-            ``np.nan, np.nan`` when the expansion is infeasible 
+            ``(np.nan, np.nan, np.nan)`` when the expansion is infeasible 
             (missing data, cycle, or no neighbours to expand from).
         """
         # 1. Cycle guard
@@ -312,15 +351,17 @@ class FlowLinkBalancer():
         Parameters
         ----------
         section_id : str
-        period_start : Timestamp
+        period_start : pd.Timestamp
         vehicle_type : str
         volume : float
+        volume_err : float, default = np.nan
+        weight : float, default = np.nan
 
         Returns
         -------
         dict
             Ready to be collected into a DataFrame and passed to
-            :meth:`~observations.ObservationStore.add_reconstruction`.
+            :meth:`~network_states.FlowStore.Append_estimates`.
         """
         return {
             "road_section_id":   section_id,

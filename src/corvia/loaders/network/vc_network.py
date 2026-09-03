@@ -58,9 +58,6 @@ class VCNetworkLoader(BaseNetworkLoader):
     include_geometry : bool, optional
         Whether to carry link geometries through as WKT strings.
         Defaults to ``True``.
-    verbose : bool, optional
-        See :class:`~corvia.loaders.base.NetworkDataLoader`. Defaults to
-        ``True``.
 
     Attributes
     ----------
@@ -91,9 +88,8 @@ class VCNetworkLoader(BaseNetworkLoader):
         parts_layer: str = "segmentdelen",
         sensors_layer: str = "locposten",
         include_geometry: bool = True,
-        verbose: bool = True,
     ) -> None:
-        super().__init__(source, verbose=verbose)
+        super().__init__(source)
         self._links_layer: str = links_layer
         self._parts_layer: str = parts_layer
         self._sensors_layer: str = sensors_layer
@@ -121,15 +117,24 @@ class VCNetworkLoader(BaseNetworkLoader):
         Parsing issues are recorded in :attr:`warnings`, not raised —
         inspect it after calling :meth:`load`.
         """
+        self.logger.info(
+            f"Loading '{self._source}' (layers: {self._links_layer}, {self._parts_layer}, {self._sensors_layer})."
+        )
         segments_df = gpd.read_file(self._source, layer=self._links_layer)
         parts_df = gpd.read_file(self._source, layer=self._parts_layer)
         sensors_df = gpd.read_file(self._source, layer=self._sensors_layer)
         sensors_df = sensors_df[sensors_df["LOCPOST"]<1000000]  # exclude virtual locposten
+        self.logger.debug(
+            f"Read {len(segments_df)} segment(s), {len(parts_df)} part(s), {len(sensors_df)} sensor row(s) (excluding virtual locposts)."
+        )
 
         nodes_data = self._build_nodes(segments_df)
         links_data = self._build_links(segments_df)
         sensors_data = self._map_sensors(sensors_df, parts_df, links_data)
         self._validate_topology(segments_df)
+        self.logger.info(
+            f"load() complete: {len(nodes_data)} node(s), {len(links_data)} link(s), {len(sensors_data)} sensor(s)."
+        )
 
         return links_data, nodes_data, sensors_data, segments_df.crs.to_string()
 
@@ -156,6 +161,7 @@ class VCNetworkLoader(BaseNetworkLoader):
         begin = segments_df["MP_begin"].dropna().astype(int).astype(str)
         end = segments_df["MP_einde"].dropna().astype(int).astype(str)
         unique_node_ids = set(begin) | set(end)
+        self.logger.debug(f"Derived {len(unique_node_ids)} unique node(s) from segment endpoints.")
         return [{"node_id": node_id} for node_id in unique_node_ids]
 
     def _build_links(self, segments_df: gpd.GeoDataFrame) -> List[dict]:
@@ -180,7 +186,9 @@ class VCNetworkLoader(BaseNetworkLoader):
         if self._include_geometry:
             cols = cols + ["geometry"]
 
-        return links_df[cols].to_dict(orient="records")
+        records = links_df[cols].to_dict(orient="records")
+        self.logger.debug(f"Derived {len(records)} link(s) from segments layer.")
+        return records
 
     def _map_sensors(
         self,
@@ -212,7 +220,7 @@ class VCNetworkLoader(BaseNetworkLoader):
         # Identify rows with missing part_id
         loc_missing_parts = sensors[sensors["part_id"].isna()]["location_id"]
         if len(loc_missing_parts) > 0:
-            self._warn(
+            self.logger.warning(
                 f"[Warning] Locposts with id's '{loc_missing_parts}' skipped because it has a NULL part_id (SD_ID)."
             )
 
@@ -233,14 +241,14 @@ class VCNetworkLoader(BaseNetworkLoader):
         for idx, row in sensors.iterrows():
             parent_link_id = part_to_link.get(row["part_id"])
             if parent_link_id is None:
-                self._warn(
+                self.logger.warning(
                     f"[Warning] Locpost '{row['location_id']}' has SD_id '{row['part_id']}' "
                     f"which is missing from the segmentdelen lookup layer."
                 )
                 unmapped += 1
                 continue
             if parent_link_id not in valid_link_ids:
-                self._warn(
+                self.logger.warning(
                     f"[Warning] Parent segment '{parent_link_id}' for locpost '{row['location_id']}' "
                     f"not found in the segmenten layer."
                 )
@@ -249,7 +257,7 @@ class VCNetworkLoader(BaseNetworkLoader):
             sensors.loc[idx, "link_id"] = parent_link_id
 
         sensors = sensors.dropna(subset=["link_id"])
-        self._warn(
+        self.logger.info(
             f"Successfully mapped {len(sensors)} sensors to network links."
             + (f" Failed to map {unmapped} sensors." if unmapped else "")
         )
@@ -269,8 +277,7 @@ class VCNetworkLoader(BaseNetworkLoader):
         Notes
         -----
         Purely diagnostic — mismatches are recorded via
-        :meth:`~corvia.loaders.base.BaseNetworkLoader._warn` and never
-        stop parsing.
+        :meth:`~self.logger.warning()` and never stop parsing.
         """
         by_id = {str(row["SG_ID"]): row for _, row in segments_df.iterrows()}
 
@@ -285,7 +292,7 @@ class VCNetworkLoader(BaseNetworkLoader):
             for prev_id in prev_link_ids:
                 prev = by_id.get(prev_id)
                 if prev is not None and str(prev["MP_einde"]) != start_node:
-                    self._warn(
+                    self.logger.warning(
                         f"[Warning] Topology mismatch: upstream segment '{prev_id}' "
                         f"ends at node '{prev['MP_einde']}', but segment '{sg_id}' "
                         f"starts at '{start_node}'."
@@ -294,7 +301,7 @@ class VCNetworkLoader(BaseNetworkLoader):
             for next_id in next_link_ids:
                 nxt = by_id.get(next_id)
                 if nxt is not None and str(nxt["MP_begin"]) != end_node:
-                    self._warn(
+                    self.logger.warning(
                         f"[Warning] Topology mismatch: downstream segment '{next_id}' "
                         f"starts at node '{nxt['MP_begin']}', but segment '{sg_id}' "
                         f"ends at '{end_node}'."

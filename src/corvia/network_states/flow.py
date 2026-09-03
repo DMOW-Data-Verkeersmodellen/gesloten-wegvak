@@ -13,11 +13,36 @@ import pandas as pd
 from corvia.framework.network import Network
 import corvia.utils as utils
 
+from corvia.logger import get_logger
+logger = get_logger(__name__)
+
 
 class FlowStore():
     """
     Consolidated memory-optimized data container holding time-series measurements,
     reconstructions, and algorithm weights across the entire highway network.
+
+    Parameters
+    ----------
+    vehicle_types : tuple of str or None, optional
+        Restricts the ``vehicle_type`` category allowed in this store.
+        Defaults to ``("PW", "VR", "TOTAL", "PAE")``; pass ``None`` for no
+        restriction.
+
+    Attributes
+    ----------
+    SOURCE_OBS, SOURCE_REC, SOURCE_RES : str
+        Allowed values for the ``source_type`` column: direct sensor
+        observation, algorithmic reconstruction, and resolver-published
+        baseline, respectively.
+    COLUMNS : list of str
+        Full column schema of the underlying matrix.
+    VTYPE_DEFAULTS : tuple of str
+        Default ``vehicle_types`` restriction used by :meth:`__init__`.
+    SCREENING_STATES : set of str
+        Allowed values for the ``screening`` column.
+    VALIDATION_STATES : set of str
+        Allowed values for the ``validation`` column.
     """
 
     SOURCE_OBS = "direct_sensor"
@@ -36,6 +61,8 @@ class FlowStore():
     def __init__(self, vehicle_types: Optional[Tuple[str, ...]] = VTYPE_DEFAULTS) -> None:
         self._vehicle_types = tuple(vehicle_types) if vehicle_types is not None else None
         self._df = self._create_empty_matrix()
+        self.logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+        self.logger.debug(f"FlowStore initialized (vehicle_types={self._vehicle_types}).")
 
     @classmethod
     def from_dataframe(
@@ -106,9 +133,26 @@ class FlowStore():
         return self._vehicle_types
 
     def set_validation_state(self, indices: pd.Index | list | np.array, state: str) -> None:
-        """Sets the dynamic validation state for given indices. See FlowStore.VALIDATION_STATES for the allowed values."""
+        """
+        Sets the dynamic validation state for given indices. See
+        FlowStore.VALIDATION_STATES for the allowed values.
+
+        Parameters
+        ----------
+        indices : pd.Index or list or np.array
+            Row indices (into :attr:`dataframe`) to update.
+        state : str
+            Must be one of :attr:`VALIDATION_STATES`.
+
+        Raises
+        ------
+        ValueError
+            If *state* is not a recognized validation state.
+        """
         if state not in self.VALIDATION_STATES:
-            raise ValueError(f"Invalid validation state: '{state}'. Must be one of {self.VALIDATION_STATES}")
+            error_msg = f"Invalid validation state '{state}' requested; must be one of {self.VALIDATION_STATES}."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
         indices = pd.Index(indices)
         if not indices.dropna().empty:
             self._df.loc[indices, "validation"] = state
@@ -132,6 +176,10 @@ class FlowStore():
             mask &= self._df["vehicle_type"].isin(vehicle_types)
         if periods is not None:
             mask &= self._df["timestamp"].isin(periods)
+        self.logger.debug(
+            f"clear_reconstructions() purging {int(mask.sum())} row(s) "
+            f"(vehicle_types={vehicle_types}, periods={periods})."
+        )
         self._df = self._df[~mask].reset_index(drop=True)
 
     def clear_resolved(
@@ -159,6 +207,10 @@ class FlowStore():
             mask &= self._df["timestamp"].isin(periods)
         if source_id is not None:
             mask &= self._df["source_id"] == source_id
+        self.logger.debug(
+            f"clear_resolved() purging {int(mask.sum())} row(s) "
+            f"(vehicle_types={vehicle_types}, periods={periods}, source_id={source_id})."
+        )
         self._df = self._df[~mask].reset_index(drop=True)
 
     def append_estimates(self, df_to_append: pd.DataFrame) -> None:
@@ -192,17 +244,21 @@ class FlowStore():
         required = [c for c in self.COLUMNS if c not in optional_with_default]
         missing = [c for c in required if c not in df_copy.columns]
         if missing:
-            raise ValueError(f"Cannot append: missing required columns: {missing}")
+            error_msg = f"append_estimates() cannot append, missing required columns: {missing}."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
         # 1. Check and validate "screening" values if present in incoming data
         if "screening" in df_copy.columns:
             incoming_screening = set(df_copy["screening"].dropna().unique())
             invalid_screen = incoming_screening - self.SCREENING_STATES
             if invalid_screen:
-                raise ValueError(
-                    f"Cannot append: 'screening' column contains invalid values: {invalid_screen}. "
+                error_msg = (
+                    f"append_estimates() cannot append, invalid 'screening' values: {invalid_screen}."
                     f"Must be one of {self.SCREENING_STATES}"
                 )
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
         else:
             # Fallback default if not supplied
             df_copy["screening"] = "unknown"
@@ -212,10 +268,12 @@ class FlowStore():
             incoming_validation = set(df_copy["validation"].dropna().unique())
             invalid_valid = incoming_validation - self.VALIDATION_STATES
             if invalid_valid:
-                raise ValueError(
-                    f"Cannot append: 'validation' column contains invalid values: {invalid_valid}. "
+                error_msg = (
+                    f"append_estimates() cannot append, invalid 'validation' values: {invalid_valid}."
                     f"Must be one of {self.VALIDATION_STATES}"
                 )
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
         else:
             # Default state
             df_copy["validation"] = "pending"
@@ -226,10 +284,12 @@ class FlowStore():
             incoming_vehicle_type = set(df_copy["vehicle_type"].dropna().unique())
             invalid_vt = incoming_vehicle_type - set(self._vehicle_types)
             if invalid_vt:
-                raise ValueError(
-                    f"Cannot append: 'vehicle_type' column contains invalid values: {invalid_vt}. "
+                error_msg = (
+                    f"append_estimates() cannot append, invalid 'vehicle_type' values: {invalid_vt}."
                     f"Must be one of {self._vehicle_types}"
                 )
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
 
         # 4. Cast to the right types to avoid memory bloat and ensure consistency
         df_copy["road_section_id"] = df_copy["road_section_id"].astype("string")
@@ -246,6 +306,7 @@ class FlowStore():
         df_copy = df_copy[self.COLUMNS]
         
         self._df = pd.concat([self._df, df_copy], ignore_index=True)
+        self.logger.info(f"append_estimates () appended {len(df_copy)} row(s); store now holds {len(self._df)} row(s).")
 
     def load_raw_observations(self, network: Network, counts_df: pd.DataFrame) -> None:
         """
@@ -257,7 +318,14 @@ class FlowStore():
             The compiled network infrastructure map.
         counts_df : pd.DataFrame
             Must contain columns: ['timestamp', 'location_id', 'vehicle_type', 'volume']
-            Optional column: ['volume_err'] for error estimates. If not provided, defaults to NaN.
+            Optional column: ['volume_err'] for error estimates, 
+            if not provided, defaults to NaN.
+
+        Raises
+        ------
+        ValueError
+            If none of *counts_df*'s ``location_id`` values match a sensor in
+            *network*.
         """
         # Map location_id -> road_section_id using the network topology graph
         sensor_to_section = {}
@@ -266,7 +334,9 @@ class FlowStore():
                 sensor_to_section[sensor.location_id] = sec_id
 
         if not sensor_to_section:
-            raise ValueError("No matching sensors found within the provided network topology.")
+            error_msg = "load_raw_observations() found no matching sensors within the provided network topology."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
         records = counts_df.copy()
         records["road_section_id"] = records["location_id"].map(sensor_to_section)
@@ -277,6 +347,12 @@ class FlowStore():
             records["screening"] = "unknown"
         
         # Strip measurements from any location that couldn't be mapped
+        unmapped = int(records["road_section_id"].isna().sum())
+        if unmapped:
+            self.logger.warning(
+                f"load_raw_observations: dropping {unmapped} row(s) whose "
+                f"location_id could not be mapped to a road section."
+            )
         records = records.dropna(subset=["road_section_id"])
 
         # Format columns for the master matrix
@@ -285,6 +361,7 @@ class FlowStore():
         records["weight"] = 1.0
         records["validation"] = "pending"
 
+        self.logger.info(f"load_raw_observations() loaded {len(records)} row(s) from {len(counts_df)} raw record(s).")
         self.append_estimates(records[self.COLUMNS])
 
     def section_consensus(
@@ -310,8 +387,9 @@ class FlowStore():
 
         Returns
         -------
-        float or None
-            None when no matching rows exist or all volumes are NaN.
+        volume, volume_err : float, float
+            Weighted mean volume and its error. ``(np.nan, np.nan)`` when no
+            matching rows exist or all volumes are NaN.
         """
         mask = (
             (self._df["road_section_id"] == road_section_id) &
@@ -371,6 +449,10 @@ class FlowStore():
             mask &= self._df["source_id"] == source_id
         resolved = self._df[mask]
         if resolved.empty:
+            self.logger.debug(
+                f"lookup_resolved_baseline: no SOURCE_RES rows available (source_id={source_id}); "
+                f"returning all-NaN for {len(target_rows)} target row(s)."
+            )
             return pd.DataFrame(np.nan, index=target_rows.index, columns=["baseline", "baseline_error"])
 
         lookup_map = (
@@ -383,4 +465,11 @@ class FlowStore():
             on=["road_section_id", "timestamp", "vehicle_type"],
             how="left"
         ).set_index("index")[["baseline", "baseline_error"]]
+
+        unmatched = int(baseline["baseline"].isna().sum())
+        if unmatched:
+            self.logger.debug(
+                f"lookup_resolved_baseline: {unmatched}/{len(target_rows)} target row(s) "
+                f"had no matching resolved baseline (source_id={source_id})."
+            )
         return baseline

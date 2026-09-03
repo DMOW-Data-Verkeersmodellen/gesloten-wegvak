@@ -26,6 +26,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List, Tuple
 
+from corvia.logger import get_logger
+logger = get_logger(__name__)
+
 
 class BaseNetworkLoader(ABC):
     """
@@ -40,10 +43,6 @@ class BaseNetworkLoader(ABC):
     ----------
     _source : str
         Stored source path.
-    _verbose : bool
-        Stored verbosity flag.
-    _warnings : list of str
-        Diagnostic messages collected during :meth:`load`.
 
     Examples
     --------
@@ -54,10 +53,10 @@ class BaseNetworkLoader(ABC):
     ... )
     """
 
-    def __init__(self, source: str, verbose: bool = True) -> None:
+    def __init__(self, source: str) -> None:
         self._source: str = source
-        self._verbose: bool = verbose
-        self._warnings: List[str] = []
+        self.logger = get_logger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+        self.logger.debug(f"{self.__class__.__name__} initialized for source '{source}'.")
 
     # ------------------------------------------------------------------
     # Property getters
@@ -67,32 +66,6 @@ class BaseNetworkLoader(ABC):
     def source(self) -> str:
         """str : Path to the raw data source *(read-only)*."""
         return self._source
-
-    @property
-    def warnings(self) -> List[str]:
-        """list of str : Diagnostic messages collected during :meth:`load` *(read-only snapshot)*."""
-        return list(self._warnings)
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def _warn(self, message: str) -> None:
-        """
-        Record a diagnostic message produced while parsing.
-
-        Parameters
-        ----------
-        message : str
-
-        Notes
-        -----
-        Always appended to :attr:`warnings` for programmatic inspection;
-        also printed immediately when :attr:`_verbose` is ``True``.
-        """
-        self._warnings.append(message)
-        if self._verbose:
-            print(message)
 
     # ------------------------------------------------------------------
     # Interface
@@ -120,4 +93,4 @@ class BaseNetworkLoader(ABC):
         raise NotImplementedError
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(source={self._source!r}, warnings={len(self._warnings)})"
+        return f"{self.__class__.__name__}(source={self._source!r})"

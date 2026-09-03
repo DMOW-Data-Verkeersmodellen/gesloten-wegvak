@@ -25,6 +25,9 @@ import pandas as pd
 from corvia.framework.network import Network
 from corvia.network_states.flow import FlowStore
 
+from corvia.logger import get_logger
+logger = get_logger(__name__)
+
 
 def relative_volume_error(rel_err: float) -> Callable[[pd.DataFrame], pd.Series]:
     """
@@ -151,6 +154,7 @@ class VCFlowDataLoader:
         self._volume_err_fn: Callable[[pd.DataFrame], pd.Series] = (
             volume_err_fn if volume_err_fn is not None else relative_volume_error(0.05)
         )
+        self.logger = get_logger(f"{__name__}.{self.__class__.__name__}")
 
     # ------------------------------------------------------------------
     # Interface
@@ -178,23 +182,28 @@ class VCFlowDataLoader:
             and the ``pct_*`` reconstruction-quality ratios.
         """
         if not self._csv_filenames:
-            raise ValueError("aggregate() needs csv_filenames — none were given to FlowDataLoader().")
+            error_msg = "aggregate() called with no csv_filenames configured."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
         df = self._read_and_clean()
         df = self._filter_period(df, time_column="TIME_MEASURED", dT=self._time_delta)
         if df.empty:
-            raise ValueError(
-                "No records found in the requested start/end range. "
-                "Check your CSV timestamps and the start/end arguments."
+            error_msg = (
+                f"No records found in the requested timeperiod [{self._start}, {self._end}). "
+                "Check your CSV timestamps and the start/end arguments. "
             )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
         df = self._compute_volumes(df)
         grouped = self._group_by_period(df)
         grouped = self._compute_ratios(grouped)
 
         if output_path:
             grouped.to_csv(output_path, index=False, sep=output_delimiter)
-            print(f"> Saved aggregated report to '{output_path}'.")
+            self.logger.info(f"> Aggregated report saved to '{output_path}'.")
 
+        self.logger.info(f"aggregate() complete: {len(grouped)} row(s) across {grouped["LOCPOST"].nunique()} sensor bucket(s).")
         return grouped
 
     def prepare(
@@ -227,18 +236,21 @@ class VCFlowDataLoader:
             ``pct_*`` quality columns — ready to review/edit and hand to
             :meth:`~corvia.network_states.flow.FlowStore.from_dataframe`.
         """
+        self.logger.info(f"prepare() started.")
         if report is None:
             df = self.aggregate()
         else:
             try:
                 df = self._read_report(report, delimiter)
             except FileNotFoundError:
-                print(f"> WARNING: {report} not found. Aggregating raw data and saving it to requested file.")
+                self.logger.warning(f"Report '{report}' not found; aggregating raw data instead.")
                 df = self.aggregate(output_path=report, output_delimiter=delimiter)
 
         df = self._map_sections(df, network)
         df = self._melt_vehicle_types(df)
-        return self._finalize(df)
+        result = self._finalize(df)
+        self.logger.info(f"prepare() complete: {len(result)} row(s) ready for FlowStore.")
+        return result
 
     # ------------------------------------------------------------------
     # aggregate() steps
@@ -256,13 +268,13 @@ class VCFlowDataLoader:
         """
         loaded = []
         for filename in self._csv_filenames:
-            print(f"> Reading sensor data from: '{filename}'...")
+            self.logger.info(f"> Reading sensor data from: '{filename}'...")
             raw = pd.read_csv(filename, delimiter=self._delimiter)
             raw["TIME_MEASURED"] = pd.to_datetime(raw["TIME_MEASURED"], format="mixed")
             existing_cols = [c for c in self.RAW_COLUMNS if c in raw.columns]
             loaded.append(raw[existing_cols])
 
-        print("> Merging raw datasets...")
+        self.logger.info("> Merging raw datasets...")
         df = pd.concat(loaded, ignore_index=True)
 
         df["LOCPOST"] = (
@@ -273,6 +285,7 @@ class VCFlowDataLoader:
             .astype(str)
             .str.strip()
         )
+        self.logger.info(f"Read and merged {len(df)} row(s) from {len(self._csv_filenames)} file(s).")
         return df
 
     @staticmethod
@@ -364,7 +377,7 @@ class VCFlowDataLoader:
             Grouped frame with a ``timestamp`` column (renamed from
             the ``TIME_MEASURED`` bucket key).
         """
-        print(f"> Aggregating data at '{self._agg_freq}' resolution per sensor...")
+        self.logger.info(f"> Aggregating data at '{self._agg_freq}' resolution per sensor...")
         grouped = df.groupby(
             ["LOCPOST", pd.Grouper(key="TIME_MEASURED", freq=self._agg_freq)]
         ).agg(
@@ -446,11 +459,10 @@ class VCFlowDataLoader:
         Returns
         -------
         pandas.DataFrame
-            Rows whose sensor isn't attached to any section in
-            *network* are dropped and logged via
-            ``logging.getLogger(__name__).warning``.
+            Rows whose sensor isn't attached to any section in *network* 
+            are dropped and logged via ``self.logger.warning``.
         """
-        print("> Mapping sensors to road sections...")
+        self.logger.info("> Mapping sensors to road sections...")
         sensor_to_section = {
             sensor.location_id: sec_id
             for sec_id, section in network.sections.items()
@@ -462,7 +474,7 @@ class VCFlowDataLoader:
         df = df.dropna(subset=["road_section_id"])
         skipped = initial_count - len(df)
         if skipped > 0:
-            print(f"> WARNING: Skipped {skipped} sensors from report (not in network).")
+            self.logger.warning(f"Skipped {skipped} sensor row(s) from report; not attached to any section in the network.")
         return df
 
     def _melt_vehicle_types(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -488,10 +500,12 @@ class VCFlowDataLoader:
         ValueError
             If a required ``volume_{vt}`` column is missing.
         """
-        print("> Melting vehicle types...")
+        self.logger.info("> Melting vehicle types...")
         missing = [vt for vt in self._vehicle_types if f"volume_{vt}" not in df.columns]
         if missing:
-            raise ValueError(f"Report has no volume_{{vt}} column for: {missing}")
+            error_msg = f"Report is missing volume column for following vehicle types: {missing}"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
         melted = [
             df.assign(vehicle_type=vt, volume=df[f"volume_{vt}"])
@@ -514,7 +528,7 @@ class VCFlowDataLoader:
             deliberately not a judgement call this class makes; see the
             class docstring.
         """
-        print("> Finalizing flow data format...")
+        self.logger.info("> Finalizing flow data format...")
         df["volume_err"] = self._volume_err_fn(df)
         df["timestamp"] = self._resolve_timestamp(df)
         df["source_type"] = FlowStore.SOURCE_OBS
@@ -554,7 +568,9 @@ class VCFlowDataLoader:
             return pd.to_datetime(df["period_start"])
         if "DATE" in df.columns:
             return pd.to_datetime(df["DATE"])
-        raise ValueError(
-            "Report has none of 'timestamp', 'period_start', or 'DATE' — "
+        error_msg = (
+            "Cannot find a column holding time records ('timestamp', 'period_start', or 'DATE'); "
             "can't determine a timestamp for these records."
         )
+        logger.error(error_msg)
+        raise ValueError(error_msg)

@@ -20,11 +20,14 @@ accessed via ``network.nodes_gdf.loc[node.node_id]``.
 from __future__ import annotations
 from typing import List, Optional, Iterator
 
+from corvia.logger import get_logger
+logger = get_logger(__name__)
+
 class Node:
     """
-    Represents an begin or end point of a directed link.
-    Can be a intersection or simple pass-through point in the network.
-    
+    Represents the begin or end point of a directed link.
+    Can be an intersection or a simple pass-through point in the network.
+
     Parameters
     ----------
     node_id : str
@@ -38,7 +41,7 @@ class Node:
         Links whose ``end_node`` is this node.
     _outgoing_links : list of Link
         Links whose ``start_node`` is this node.
- 
+
     Examples
     --------
     >>> n1, n2 = Node("N1"), Node("N2")
@@ -114,16 +117,24 @@ class Node:
         ----------
         direction : str, default = 'downstream'
             Direction of traversal ('downstream' or 'upstream').
+
         Returns
         -------
-        neighbours : list of Nodes
+        list of Node
+
+        Raises
+        ------
+        ValueError
+            If *direction* is not 'downstream' or 'upstream'.
         """
         if direction == 'downstream':
             return [link.end_node for link in self._outgoing_links]
         elif direction == 'upstream':
             return [link.start_node for link in self._incoming_links]
         else:
-            raise ValueError("Direction must be 'downstream' or 'upstream'.")
+            error_msg = f"Invalid direction '{direction}' passed to neighbours() on {self}: should be 'downsteam' or 'upstream'."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
     # ------------------------------------------------------------------
     # Internal link registration (called by Link.__init__)
@@ -139,9 +150,9 @@ class Node:
             The directed link whose ``end_node`` is this node.
         """
         if link in self._incoming_links:
-            raise ValueError(
-                f"Link '{link.link_id}' already registered as incoming on {self}."
-            )
+            error_msg = f"Duplicate incoming registration: link '{link.link_id}' already registered on {self}."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         self._incoming_links.append(link)
  
     def _register_outgoing(self, link: Link) -> None:
@@ -154,9 +165,9 @@ class Node:
             The directed link whose ``start_node`` is this node.
         """
         if link in self._outgoing_links:
-            raise ValueError(
-                f"Link '{link.link_id}' already registered as outgoing on {self}."
-            )
+            error_msg = f"Duplicate outgoing registration: link '{link.link_id}' already registered on {self}."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         self._outgoing_links.append(link)
  
     def _deregister_incoming(self, link: Link) -> None:
@@ -164,18 +175,18 @@ class Node:
         try:
             self._incoming_links.remove(link)
         except ValueError:
-            raise ValueError(
-                f"Link '{link.link_id}' not found in incoming links of {self}."
-            )
+            error_msg = f"Cannot deregister: link '{link.link_id}' not found in incoming links of {self}."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
  
     def _deregister_outgoing(self, link: Link) -> None:
         """Remove *link* from the outgoing list (called on link deletion)."""
         try:
             self._outgoing_links.remove(link)
         except ValueError:
-            raise ValueError(
-                f"Link '{link.link_id}' not found in outgoing links of {self}."
-            )
+            error_msg = f"Cannot deregister: link '{link.link_id}' not found in outgoing links of {self}."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
     # ------------------------------------------------------------------
     # Public query helpers
@@ -231,18 +242,16 @@ class Node:
     def get_link_to(self, other: Node) -> Optional[Link]:
         """
         Return the direct link from this node to *other*, if it exists.
- 
+
         Parameters
         ----------
         other : Node
-            The candidate node.
-        direction : str, default = 'downstream'
-            Direction of traversal ('downstream' or 'upstream').
- 
+            The candidate downstream node.
+
         Returns
         -------
         Link or None
-            The matching and outgoing link, or ``None`` if not adjacent.
+            The matching outgoing link, or ``None`` if not adjacent.
         """
         for link in self._outgoing_links:
             if link.end_node is other:
@@ -275,7 +284,7 @@ class Link:
 
     A Link is a directed edge in the road-network graph.  On construction it
     automatically registers itself with both endpoint :class:`Node` objects.
-    It may carry an optional :class:`CountLocation` sensor and belong to a
+    It may carry one or more :class:`SensorLocation` sensors and belong to a
     :class:`RoadSection`.
 
     Parameters
@@ -295,11 +304,11 @@ class Link:
         Stored upstream node reference.
     _end_node : Node
         Stored downstream node reference.
-    _sensor_location : SensorLocation or None
-        Sensor attached to this link, if any.
+    _sensor_locations : list of SensorLocation
+        Sensors attached to this link.
     _parent_section : RoadSection or None
         Section that owns this link, if any.
- 
+
     Examples
     --------
     >>> n1, n2 = Node("N1"), Node("N2")
@@ -330,7 +339,7 @@ class Link:
         -------
         dict
             Keys: ``link_id``, ``start_node``, ``end_node``,
-            ``has_sensor``, ``is_assigned``, ``geometry``.
+            ``has_sensor``, ``is_assigned``.
         """
         return {
             "link_id": self._link_id,
@@ -388,7 +397,7 @@ class Link:
     # Sensor management
     # ------------------------------------------------------------------
  
-    def attach_sensor(self, sensor_location: SensorLocation) -> None:
+    def attach_sensor(self, sensor_location: SensorLocation) -> List[sensor_locations]:
         """
         Attach a :class:`SensorLocation` sensor to this link.
  
@@ -396,18 +405,28 @@ class Link:
         ----------
         sensor_location : SensorLocation
             The sensor to attach.
+
+        Raises
+        ------
+        ValueError
+            If a sensor with the same ``location_id`` is already attached.
         """
         if any(s.location_id == sensor_location.location_id for s in self._sensor_locations):
-            raise ValueError(
-                f"Link '{self._link_id}' already carries this sensor "
-                f"'{sensor_location.location_id}'."
-            )
-        self._sensor_locations.append(sensor_location)
+            error_msg = f"Duplicate sensor: link '{self._link_id}' already carries sensor '{sensor_location.location_id}'."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        logger.debug("Sensor '%s' attached to link '%s'.", sensor_location.location_id, self._link_id)
+        return self._sensor_locations.append(sensor_location)
  
     def detach_sensor(self, location_id: str) -> Optional[SensorLocation]:
         """
         Remove and return a specific sensor by its unique ID.
  
+        Parameters
+        ----------
+        location_id : str
+            Identifier of the sensor to remove.
+        
         Returns
         -------
         SensorLocation or None
@@ -415,7 +434,9 @@ class Link:
         """
         for idx, s in enumerate(self._sensor_locations):
             if s.location_id == location_id:
+                logger.debug("Sensor '%s' detached from link '%s'.", location_id, self._link_id)
                 return self._sensor_locations.pop(idx)
+        logger.warning(f"detach_sensor: sensor {location_id} not found on link {self._link_id}; nothing removed")
         return None
  
     # ------------------------------------------------------------------
@@ -457,21 +478,30 @@ class Link:
         -------
         bool
             ``True`` when ``self.end_node is other.start_node``.
+
+        Raises
+        ------
+        ValueError
+            If *direction* is not 'downstream' or 'upstream'.
         """
         if direction == 'downstream':
             return self._end_node is other.start_node
         elif direction == 'upstream':
             return self._start_node is other.end_node
+        else:
+            error_msg = f"Invalid direction '{direction}' passed to is_adjacent_to() on {self}: should be 'downstream' or 'upstream'."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
 
 class SensorLocation:
     """
     A physical sensor station attached to a specific :class:`Link`.
- 
+
     A SensorLocation represents a loop detector, radar, or any other traffic
     counting device mounted at a fixed point on the network.  It is
     associated with exactly one link (by ID) and may cover one or more lanes.
- 
+
     Parameters
     ----------
     location_id : str
@@ -482,12 +512,19 @@ class SensorLocation:
         Human-readable label (e.g. ``"A10 km 23.4"``).
     lane_count : int, optional
         Number of lanes covered by this sensor.  Must be >= 1 or 0 (unknown).
-        Defaults to ``1``.
+        Defaults to ``0``.
+
+    Raises
+    ------
+    ValueError
+        If *lane_count* is negative.
     """
  
     def __init__(self, location_id: str, link_id: str, name: Optional[str] = None, lane_count: int = 0) -> None:
         if lane_count < 0:
-            raise ValueError(f"lane_count must be >= 1 or 0 (unknown), got {lane_count}.")
+            error_msg = f"Invalid lane count {lane_count} for sensor {location_id} on link {link_id}; must be >= 1 or 0 (unknown)."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         self._location_id: str = location_id
         self._link_id: str = link_id
         self._name: Optional[str] = name
@@ -542,8 +579,18 @@ class SensorLocation:
  
     @lane_count.setter
     def lane_count(self, value: int) -> None:
+        """
+        int : Number of lanes covered by this sensor.
+
+        Raises
+        ------
+        ValueError
+            If set to a negative value.
+        """
         if value < 0:
-            raise ValueError(f"lane_count must be >= 1 or 0 (unknown), got {value}.")
+            error_msg = f"Invalid lane count {value} for sensor {self._location_id} on link {self._link_id}; must be >= 1 or 0 (unknown)."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         self._lane_count = value
 
     @property
@@ -561,12 +608,12 @@ class RoadSection:
     """
     An ordered, aggregated sequence of :class:`Link` objects with no
     intermediate exits or entries.
- 
+
     A RoadSection groups a topologically consistent chain of links that form
     a continuous, uninterrupted stretch of highway (e.g. between two ramps).
     It exposes sensor coverage metrics and provides convenient iteration and
     look-up helpers.
- 
+
     Parameters
     ----------
     section_id : str
@@ -582,11 +629,19 @@ class RoadSection:
         Stored section identifier.
     _links : list of Link
         Stored links.
-    _upstream_sections : list of RoadSection
-        Sections that lead into this one.
-    _downstream_sections : list of RoadSection
-        Sections that lead out of this one.
- 
+
+    Raises
+    ------
+    ValueError
+        If *links* is empty, or if consecutive links don't share
+        boundary nodes.
+
+    Notes
+    -----
+    Neighbouring sections (:attr:`upstream_in`, :attr:`upstream_out`,
+    :attr:`downstream_in`, :attr:`downstream_out`) are not stored — they
+    are derived on each access from the entry/exit nodes' link lists.
+
     Examples
     --------
     >>> n1, n2, n3 = Node("N1"), Node("N2"), Node("N3")
@@ -600,7 +655,9 @@ class RoadSection:
 
     def __init__(self, section_id: str, links: List[Link]) -> None:
         if not links:
-            raise ValueError("A RoadSection must contain at least one Link.")
+            error_msg = f"Cannot create RoadSection '{section_id}': empty link list"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         self._validate_chain(links)
  
         self._section_id: str = section_id
@@ -609,17 +666,22 @@ class RoadSection:
         # Back-reference each link to this section
         for link in self._links:
             link._parent_section = self
+
+        logger.debug(
+            "RoadSection '%s' created with %d link(s) (%s -> %s).", 
+            section_id, len(self._links), self.entry_node, self.exit_node
+        )
             
     def summary(self) -> dict:
         """
         Return a dictionary summarising the section's key metrics.
- 
+
         Returns
         -------
         dict
-            Keys: ``section_id``, ``link_count``, ``sensor_count``,
-            ``coverage_ratio``, ``is_fully_monitored``,
-            ``entry_node``, ``exit_node``.
+            Keys: ``section_id``, ``entry_node``, ``exit_node``,
+            ``link_count``, ``sensor_count``, ``upstream_sections_count``,
+            ``downstream_sections_count``.
         """
         return {
             "section_id": self._section_id,
@@ -734,29 +796,40 @@ class RoadSection:
         """
         for i, (a, b) in enumerate(zip(links, links[1:])):
             if a.end_node is not b.start_node:
-                raise ValueError(
+                error_msg = (
                     f"Broken chain at position {i}: Link '{a.link_id}' ends at "
                     f"{a.end_node} but Link '{b.link_id}' starts at {b.start_node}."
                 )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
     
     def append_link(self, link: Link) -> None:
         """
         Append a new link to the *end* of the section.
- 
+
         Parameters
         ----------
         link : Link
             The link to append.  Its ``start_node`` must equal the current
             :attr:`exit_node` of the section.
+
+        Raises
+        ------
+        ValueError
+            If ``link.start_node`` does not match the section's current
+            :attr:`exit_node`.
         """
         if link.start_node is not self.exit_node:
-            raise ValueError(
+            error_msg = (
                 f"Cannot append Link '{link.link_id}': its start_node "
                 f"({link.start_node}) does not match the current exit_node "
                 f"({self.exit_node})."
             )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         self._links.append(link)
         link._parent_section = self
+        logger.debug("Link '%s' appended to section '%s'.", link.link_id, self._section_id)
  
     def get_link_by_id(self, link_id: str) -> Optional[Link]:
         """

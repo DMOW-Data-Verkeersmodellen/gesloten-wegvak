@@ -1,4 +1,21 @@
-# corvia/engine/flow_resolver.py
+"""
+flow_resolver.py
+=================
+Iterative multi-pass resolution of network flow observations against a
+statistical baseline.
+
+:class:`FlowResolver` orchestrates one or more reconstruction engines and a
+pair of :class:`~corvia.engine.validators.BaseValidator` instances (a
+Rejector that runs every pass, and an optional Acceptor that runs once on
+convergence) to iteratively classify observations as conforming, rejected,
+verified, or dismissed — see :meth:`FlowResolver.run`.
+
+Dependency chain::
+
+    flow_resolver.py   →  corvia.network_states.flow.FlowStore
+                       →  corvia.engine.validators.BaseValidator
+                       →  corvia.utils
+"""
 from __future__ import annotations
 import os
 from typing import List, Tuple, Optional, TYPE_CHECKING
@@ -11,12 +28,76 @@ import matplotlib.ticker as ticker
 from corvia.network_states.flow import FlowStore
 from corvia.utils import weighted_mean_and_error
 
+from corvia.logger import get_logger
+logger = get_logger(__name__)
+
 if TYPE_CHECKING:
     from corvia.framework.network import Network
     from corvia.engine.validators import BaseValidator
 
 class FlowResolver:
-    """Manages iterative adaptive multi-pass algorithms over network state models."""
+    """
+    Manages iterative adaptive multi-pass algorithms over network state models.
+
+    Each call to :meth:`run` drives reconstruction + Rejector validation to
+    convergence, independently per vehicle type, then runs the Acceptor once
+    per vehicle type that converged. Convergence is detected either by a clean
+    pass (nothing rejected) or by the validation-state history repeating a
+    previous iteration (stable or oscillating).
+
+    Parameters
+    ----------
+    reconstructors : list
+        Reconstruction engines run each pass; each must implement
+        ``reconstruct(network, store, periods, vehicle_types)``.
+    rejector : BaseValidator
+        The Rejector: runs iteratively, flags statistical outliers.
+    acceptor : BaseValidator, optional
+        Runs ONCE per vehicle type, after the network converges, to
+        verify or dismiss the remaining observations. Defaults to ``None``
+        (every conforming observation is verified with no dismissal).
+    max_iterations : int, default = 3
+        Maximum passes per :meth:`run` call before giving up on
+        unconverged vehicle types.
+    name : str, optional
+        Used as a filename prefix for diagnostic plots. Defaults to ``None``.
+    debug_plot : bool, default = False
+        Whether to save diagnostic dashboard plots to *plot_dir* after
+        each :meth:`run` call.
+    plot_dir : str, default = 'diagnostics'
+        Output directory for diagnostic plots. Created if missing when
+        *debug_plot* is ``True``.
+    greedy_elimination : bool, default = False
+        Reject only the top-k worst offenders per pass instead of
+        everything over threshold — see class Notes.
+    greedy_adaptive_batch : bool, default = False
+        When *greedy_elimination*, double the batch size each pass the
+        flagged set stays unchanged, to speed up convergence on stable
+        pools. Ignored otherwise.
+    greedy_k_fraction : float, default = 0.10
+        Fraction of currently-flagged anomalies to reject per pass. Must
+        be in (0, 1].
+    greedy_k_pool_fraction : float, default = 0.05
+        Cap on rejection batch size, as a fraction of the active pool.
+        Must be in (0, 1].
+    greedy_k_max : int, default = 20
+        Absolute ceiling on rejection batch size per pass. Must be >= 1.
+
+    Raises
+    ------
+    ValueError
+        If *greedy_elimination* is enabled and *greedy_k_fraction* or
+        *greedy_k_pool_fraction* is outside (0, 1], or *greedy_k_max* < 1.
+
+    Notes
+    -----
+    When :attr:`greedy_elimination` is enabled, only the top-k worst offenders
+    are permanently rejected each pass (see :meth:`_select_rejection_batch_size`)
+    rather than everything over threshold at once — this keeps the baseline from
+    being computed from a fully-cleaned pool in one shot, which can otherwise
+    over-reject observations that were only anomalous because of the presence
+    of worse ones.
+    """
     
     def __init__(
         self, 
@@ -48,6 +129,7 @@ class FlowResolver:
         
         self.name = name
         self._source_id = f"{self.__class__.__name__}-baseline"
+        self.logger = get_logger(f"{__name__}.{self.__class__.__name__}")
         self.reconstructors = reconstructors
         self.rejector = rejector.run_as_rejector()
         self.acceptor = acceptor.run_as_acceptor(baseline_source_id=self._source_id) if acceptor is not None else None
@@ -60,11 +142,17 @@ class FlowResolver:
         self.greedy_adaptive_batch = greedy_adaptive_batch
         if greedy_elimination:
             if not (0 < greedy_k_fraction <= 1):
-                raise ValueError(f"greedy_k_fraction must be in (0, 1], got {greedy_k_fraction}")
+                error_msg = f"Invalid greedy_k_fraction={greedy_k_fraction}, must be in (0, 1]. "
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
             if not (0 < greedy_k_pool_fraction <= 1):
-                raise ValueError(f"greedy_k_pool_fraction must be in (0, 1], got {greedy_k_pool_fraction}")
+                error_msg = f"Invalid greedy_k_pool_fraction={greedy_k_pool_fraction}, must be in (0, 1]. "
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
             if greedy_k_max < 1:
-                raise ValueError(f"greedy_k_max must be >= 1, got {greedy_k_max}")
+                error_msg = f"Invalid greedy_k_max={greedy_k_max}, must be >=1. "
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
         self.greedy_k_fraction = greedy_k_fraction
         self.greedy_k_pool_fraction = greedy_k_pool_fraction
         self.greedy_k_max = greedy_k_max
@@ -81,6 +169,18 @@ class FlowResolver:
         clean pool converges in one pass, a messy one takes proportionally
         bigger bites) but is capped as a fraction of the active pool and by
         an absolute ceiling, so no single pass can over-reject.
+
+        Parameters
+        ----------
+        n_anomalies : int
+            Number of observations currently over the severity threshold.
+        n_pool : int
+            Size of the active observation pool this pass.
+
+        Returns
+        -------
+        int
+            Number of observations to reject this pass.
         """
         if n_anomalies == 0:
             return 0
@@ -96,17 +196,43 @@ class FlowResolver:
         periods: List[pd.Timestamp], 
         vehicle_types: List[str]
     ) -> FlowStore:
-        """Runs adaptive iterations per vehicle type until each clears or
-        stabilizes, then verifies or dismisses data per converged vehicle type."""
+        """
+        Runs adaptive iterations per vehicle type until each clears or
+        stabilizes, then verifies or dismisses data per converged vehicle type.
+
+        Parameters
+        ----------
+        network : Network
+            The road network to reconstruct/validate observations against.
+        store : FlowStore
+            Flow data store; observations, reconstructions, and resolved
+            baselines are all read from and written back to this store.
+        periods : list of pd.Timestamp
+            Must contain exactly one timestamp — see Raises.
+        vehicle_types : list of str
+            Vehicle types to resolve independently this call.
+
+        Returns
+        -------
+        FlowStore
+            The same *store*, mutated in place and returned for convenience.
+
+        Raises
+        ------
+        ValueError
+            If *periods* does not contain exactly one timestamp.
+        """
 
         if len(periods) != 1:
-            raise ValueError(
+            error_msg = (
                 "FlowResolver.run() only supports a single timestamp at a time for now "
                 "— convergence is currently tracked per vehicle type but pooled across "
                 "all given periods, so a mixed batch could silently withhold resolved "
                 "output for a clean period just because another period in the same "
                 "call didn't converge. Call run() once per timestamp instead."
             )
+            self.logger.erro(error_msg)
+            raise ValueError(error_msg)
         
         resolver_converged = {vt: False for vt in vehicle_types}
         resolver_done = {vt: False for vt in vehicle_types}
@@ -116,14 +242,14 @@ class FlowResolver:
         final_iteration = {vt: 0 for vt in vehicle_types}
 
         if self.greedy_elimination:
-            print("Running FlowResolver GREEDILY")
+            self.logger.info("Running FlowResolver GREEDILY")
 
         for iteration in range(1, self.max_iterations + 1):
             active_vtypes = [vt for vt in vehicle_types if not resolver_done[vt]]
             if not active_vtypes:
                 break
 
-            print(f"[Pass {iteration}] Generating network estimations...")
+            self.logger.info(f"[Pass {iteration}] Generating network estimations...")
             store.clear_reconstructions(vehicle_types=active_vtypes, periods=periods)
             
             # Execute reconstruction engines
@@ -149,17 +275,19 @@ class FlowResolver:
         else:
             still_active = [vt for vt, done in resolver_done.items() if not done]
             if still_active:
-                print(
-                    f"WARNING: FlowResolver reached maximum iterations ({self.max_iterations}) "
-                    f"without convergence for vehicle types: {still_active}"
+                self.logger.warning(
+                    f"FlowResolver reached maximum iterations ({self.max_iterations}) "
+                    f"without convergence for vehicle types {still_active}"
                 )
     
         # Only publish resolved baselines for vtypes that actually converged.
         converged_vtypes = {vt for vt, ok in resolver_converged.items() if ok}
         not_converged_vtypes = [vt for vt in vehicle_types if vt not in converged_vtypes]
-        print(f"[{periods[0]}] Resolver summary:")
-        print(f"    Converged (resolved output refreshed): {sorted(converged_vtypes) or 'none'}")
-        print(f"    Not converged (resolved output left as-is, if any exists): {sorted(not_converged_vtypes) or 'none'}")
+        self.logger.info(
+            f"[{periods[0]}] Resolver summary:\n"
+            f"    Converged (resolved output refreshed): {sorted(converged_vtypes) or 'none'}\n"
+            f"    Not converged (resolved output left as-is, if any exists): {sorted(not_converged_vtypes) or 'none'}"
+        )
     
         if self.debug_plot:
             for vt in vehicle_types:
@@ -183,6 +311,27 @@ class FlowResolver:
         Runs Rejector validation/rejection bookkeeping for a single vehicle
         type within one pass, and — on convergence — runs the Acceptor once
         for that vehicle type.
+
+        Parameters
+        ----------
+        store : FlowStore
+        df : pd.DataFrame
+            Snapshot of ``store.dataframe`` taken at the start of this pass.
+        vt : str
+            Vehicle type being processed this call.
+        periods : list of pd.Timestamp
+        iteration : int
+            Current pass number (1-indexed).
+        prev_deferred_indices : dict
+            Mapping of vehicle_type -> indices deferred (over threshold, not
+            yet rejected) at the end of the previous pass. Mutated in place.
+        adaptive_multiplier : dict
+            Mapping of vehicle_type -> current greedy batch-size multiplier.
+            Mutated in place; only relevant when :attr:`greedy_adaptive_batch`.
+        snapshots : dict
+            Mapping of vehicle_type -> list of (iteration, store.dataframe
+            copy) tuples, accumulated across passes for oscillation detection.
+            Mutated in place (appended to).
 
         Returns
         -------
@@ -250,14 +399,14 @@ class FlowResolver:
         validated_idx = pd.Index(idx_conforming).union(pd.Index(idx_rejected)) 
         failed_idx = obs_rows.index.difference(validated_idx)
         if len(failed_idx) == len(obs_rows) and len(obs_rows) > 0:
-            print(
-                f"CRITICAL: Reconstruction {vt} failed completely for all {len(obs_rows)} observations. "
+            self.logger.critical(
+                f"Reconstruction {vt} failed completely for all {len(obs_rows)} observations. "
                 f"No baseline consensus could be computed. Breaking resolving loop."
             )
             return True, False
         elif len(failed_idx) > 0:
-            print(
-                f"WARNING: Reconstruction {vt} failed to generate consensus baselines for {len(failed_idx)} "
+            self.logger.info(
+                f"> Reconstruction {vt} failed to generate consensus baselines for {len(failed_idx)} "
                 f"observations. These values remain in a 'unresolved' state."
             )
 
@@ -270,18 +419,18 @@ class FlowResolver:
         )
 
         if len(idx_rejected) == 0:
-            print(f"--> Architecture converged cleanly for {vt} at iteration {iteration}")
-            #print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
+            self.logger.info(f"> Architecture converged cleanly for {vt} at iteration {iteration}")
+            #print(f"> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
             if self._publish_resolved_for_vtype(store, vt, periods):
                 self._run_acceptor_for_vtype(store, vt, periods)
             return True, True
 
         if self.greedy_elimination:
-            print(
-                f"--> Pool {vt} shrinking: {len(idx_rejected_ranked)} remain over threshold, "
+            self.logger.info(
+                f"> Pool {vt} shrinking: {len(idx_rejected_ranked)} remain over threshold, "
                 f"rejected top {len(rejected_this_pass)}, deferred {len(idx_deferred)} for re-scoring."
             )
-            print(f"--> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
+            self.logger.info(f"> {int(rejected_mask.sum())} {vt} observations rejected in total: {store.dataframe.loc[rejected_mask].index.to_list()}.")
             return False, False
 
         # Non-greedy: check this vtype's own validation history for a repeat/oscillation.
@@ -313,14 +462,14 @@ class FlowResolver:
 
         if detected_duplicate:
             if duplicate_iteration == iteration - 1:
-                print(f"--> Convergence for {vt} reached at iteration {iteration}: Validation states have stabilized.")
+                self.logger.info(f"> Convergence for {vt} reached at iteration {iteration}: Validation states have stabilized.")
             else:
-                print(f"--> Convergence for {vt} stopped at iteration {iteration}: Detected an oscillation cycle (matches iteration {duplicate_iteration}).")
+                self.logger.info(f"> Convergence for {vt} stopped at iteration {iteration}: Detected an oscillation cycle (matches iteration {duplicate_iteration}).")
             if self._publish_resolved_for_vtype(store, vt, periods):
                 self._run_acceptor_for_vtype(store, vt, periods)
             return True, True
         
-        print(f"--> No convergence found for {vt}, outliers over threshold: {list(idx_rejected_ranked)}")
+        self.logger.info(f"> No convergence found for {vt}, outliers over threshold: {list(idx_rejected_ranked)}")
         return False, False
     
     def _run_acceptor_for_vtype(self, store: FlowStore, vt: str, periods: List[pd.Timestamp]) -> None:
@@ -331,6 +480,14 @@ class FlowResolver:
 
         If self.acceptor is None, every conforming row simply becomes
         "verified" and nothing is dismissed.
+
+        Parameters
+        ----------
+        store : FlowStore
+        vt : str
+            Vehicle type whose conforming observations should be relabeled.
+        periods : list of pd.Timestamp
+            Unused directly — kept for signature symmetry with sibling methods.
         """
         conforming_mask = (
             (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
@@ -342,7 +499,7 @@ class FlowResolver:
         if conforming_idx.empty:
             pass
         elif self.acceptor is None:
-            print("--> No acceptor given, verifying all 'conforming' observations")
+            self.logger.info("> No acceptor given, verifying all 'conforming' observations")
             store.set_validation_state(conforming_idx, "verified")
         else:
             verified_idx, dismissed_idx = self.acceptor.validate(store, conforming_idx)
@@ -353,20 +510,31 @@ class FlowResolver:
             (store.dataframe["source_type"] == FlowStore.SOURCE_OBS)
             & (store.dataframe["vehicle_type"] == vt)
         ]["validation"].value_counts()
-        print(
-            f"--> Final tally {vt}:\n"
-            f"      rejected:   {int(final_counts.get('rejected', 0)):>6}\n"
-            f"      verified:   {int(final_counts.get('verified', 0)):>6}\n"
-            f"      dismissed:  {int(final_counts.get('dismissed', 0)):>6}\n"
-            f"      unresolved: {int(final_counts.get('unresolved', 0)):>6}"
+        self.logger.info(
+            f"> Final tally {vt}:\n"
+            f"\trejected:\t{int(final_counts.get('rejected', 0)):>6}\n"
+            f"\tverified:\t{int(final_counts.get('verified', 0)):>6}\n"
+            f"\tdismissed:\t{int(final_counts.get('dismissed', 0)):>6}\n"
+            f"\tunresolved:\t{int(final_counts.get('unresolved', 0)):>6}"
         )
 
     def _publish_resolved_for_vtype(self, store: FlowStore, vt: str, periods: List[pd.Timestamp]) -> bool:
         """
         Computes and publishes (SOURCE_RES) the Rejector's baseline for this
         vehicle type/period, replacing any prior resolved output at the same
-        coordinates from this resolver. Returns True if a baseline was
-        actually published.
+        coordinates from this resolver.
+
+        Parameters
+        ----------
+        store : FlowStore
+        vt : str
+        periods : list of pd.Timestamp
+
+        Returns
+        -------
+        bool
+            True if a baseline was actually published, False if there was
+            nothing to publish (no surviving reconstruction traces for *vt*).
         """
         store.clear_resolved(vehicle_types=[vt], periods=periods, source_id=self._source_id)
 
@@ -377,7 +545,7 @@ class FlowResolver:
         )
         resolved_df = resolved_df[resolved_df["vehicle_type"] == vt]
         if resolved_df.empty:
-            print(f"WARNING: [{vt}] No reconstruction traces available — nothing to publish, skipping acceptor.")
+            self.logger.warning(f"[{vt}] No reconstruction traces available — nothing to publish, skipping acceptor.")
             return False
 
         resolved_df["source_type"] = FlowStore.SOURCE_RES
@@ -391,6 +559,19 @@ class FlowResolver:
             sections_to_plot: Optional[List[str]] = None,
             sections_per_plot: int = 20
         ) -> None:
+        """
+        Restricts which road sections diagnostic plots cover, and how many
+        sections appear per plot.
+
+        Parameters
+        ----------
+        sections_to_plot : list of str, optional
+            Road section IDs to include in diagnostic plots. Defaults to
+            ``None`` (plot every section present in the data).
+        sections_per_plot : int, default = 20
+            Sections shown per dashboard chunk — large networks are split
+            across multiple plot files at this size.
+        """
         self._sections_to_plot = sections_to_plot
         self._sections_per_plot = sections_per_plot
 
@@ -401,12 +582,34 @@ class FlowResolver:
         timestamp: pd.Timestamp, 
         vehicle_type: str
     ) -> None:
-        """Generates a standalone single-iteration snapshot figure with a horizontal bottom legend."""
+        """
+        Generates a standalone single-iteration snapshot figure with a horizontal bottom legend.
+
+        Parameters
+        ----------
+        iteration : int
+            Pass number this snapshot reflects — used only in the output
+            filename, not in the plotted data itself (the plot always reflects
+            *store*'s current state).
+        store : FlowStore
+        timestamp : pd.Timestamp
+            Period to plot.
+        vehicle_type : str
+            Vehicle type to plot.
+
+        Notes
+        -----
+        No-op (returns without plotting) if *store* has no rows matching
+        *timestamp* and *vehicle_type*. Splits into multiple files, one per
+        :attr:`_sections_per_plot`-sized chunk, when more sections are present
+        than fit in one dashboard.
+        """
         df = store.dataframe
         snap_mask = (df["timestamp"] == timestamp) & (df["vehicle_type"] == vehicle_type)
         snap_data = df[snap_mask]
         
         if snap_data.empty:
+            self.logger.debug(f"plot_iteration_snapshot: no data for vt={vehicle_type} at {timestamp}, skipping.")
             return
             
         all_sections = snap_data["road_section_id"].unique()
@@ -615,6 +818,13 @@ class FlowResolver:
         """
         Generates comparative dashboard grids across multiple iterations, 
         ensuring proper row height dimensions and de-duplicated external legends.
+
+        Parameters
+        ----------
+        vehicle_type : str
+        historical_states : list of (int, pd.DataFrame)
+            One (iteration, store.dataframe copy) tuple per pass this vehicle
+            type ran, as accumulated in :meth:`run`.
         """
         first_df = historical_states[0][1]
         unique_timestamps = (

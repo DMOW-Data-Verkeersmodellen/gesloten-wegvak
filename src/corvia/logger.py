@@ -50,30 +50,26 @@ def configure_logging(
 
     Parameters
     ----------
-    log_level : int, default: logging.INFO
+    log_level : int, default = logging.INFO
         Root logger level for the ``corvia`` logger.
-    console_level : int, optional, default: None
+    console_level : int, optional, default = None
         Console output level. Falls back to *log_level* when ``None``.
-    file_level : int, optional, default: None
+    file_level : int, optional, default = None
         File output level. Falls back to *log_level* when ``None``.
-    log_to_file : bool, default: False
+    log_to_file : bool, default = False
         Enable file logging.
-    log_to_console : bool, default: True
+    log_to_console : bool, default = True
         Enable console logging.
-    log_dir : str, default: 'logs'
+    log_dir : str, default = 'logs'
         Directory for log files.
-    log_format : str, default: 'detailed'
+    log_format : str, default = 'detailed'
         Format style - 'simple', 'detailed', or 'minimal'.
-    max_bytes : int, default: 10*1024*1024
+    max_bytes : int, default = 10*1024*1024
         Max log file size before rotation (default: 10MB).
-    backup_count : int, default: 5
+    backup_count : int, default = 5
         Number of backup log files to keep.
-    force_reconfigure : bool, default: False
+    force_reconfigure : bool, default = False
         Force reconfiguration even if already configured.
-
-    Returns
-    -------
-    None
     """
     global _logging_configured
 
@@ -99,22 +95,19 @@ def configure_logging(
 
     # Define format styles
     formats = {
-        'minimal': '%(levelname)s - %(message)s',
-        'simple': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        'detailed': '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+        'minimal': '%(levelname)s - %(name)s - %(message)s',
+        'simple': '%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        'detailed': '%(asctime)s - %(levelname)s - %(name)s - [%(filename)s:%(lineno)d] - %(message)s',
     }
-
-    log_format_str = formats.get(log_format, formats['detailed'])
-    formatter = logging.Formatter(
-        fmt=log_format_str,
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
 
     # Console handler
     if log_to_console:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(console_level)
-        console_handler.setFormatter(formatter)
+        console_formatter = ShortNameFormatter(
+            fmt='%(levelname)s - %(shortname)s - %(message)s'
+        )
+        console_handler.setFormatter(console_formatter)
         pkg_logger.addHandler(console_handler)
 
     # File handler
@@ -131,7 +124,16 @@ def configure_logging(
             encoding='utf-8'
         )
         file_handler.setLevel(file_level)
-        file_handler.setFormatter(formatter)
+        log_format_str = formats.get(log_format, formats['detailed'])
+        formatter = logging.Formatter(
+            fmt=log_format_str,
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_formatter = logging.Formatter(
+            fmt='%(asctime)s - %(levelname)s - %(name)s - [%(filename)s:%(lineno)d] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_formatter)
         pkg_logger.addHandler(file_handler)
 
     # If no handlers were added, add a NullHandler to prevent warnings
@@ -189,16 +191,12 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def disable_logging():
+def disable_logging() -> None:
     """
     Disable all logging output for the package.
 
     Useful for tests or when using the package as a library and you don't
     want any log output.
-
-    Returns
-    -------
-    None
     """
     global _logging_configured
     pkg_logger = logging.getLogger(_PACKAGE_LOGGER_NAME)
@@ -208,15 +206,11 @@ def disable_logging():
     _logging_configured = True
 
 
-def reset_logging():
+def reset_logging() -> None:
     """
     Reset logging configuration to defaults.
 
     Useful for testing or if you need to reconfigure.
-
-    Returns
-    -------
-    None
     """
     global _logging_configured
     _logging_configured = False
@@ -232,5 +226,12 @@ def _cleanup_handlers():
         if isinstance(handler, logging.FileHandler):
             handler.close()
 
+
+class ShortNameFormatter(logging.Formatter):
+    """Custom formatter that adds a 'shortname' attribute to log records."""
+    def format(self, record: logging.LogRecord) -> str:
+        # Extracts the last component (e.g., 'FlowResolver' from 'corvia.engine.flow_resolver.FlowResolver')
+        record.shortname = record.name.split('.')[-1]
+        return super().format(record)
 
 __all__ = ['get_logger', 'configure_logging', 'disable_logging', 'reset_logging']

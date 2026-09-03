@@ -1,7 +1,17 @@
+"""
+utils.py
+========
+Shared statistical helpers for weighted aggregation and standardized
+comparison, used across the validation and reconstruction engines.
+"""
 from typing import Tuple, Union, Optional, TYPE_CHECKING
+import sys
 
 import numpy as np
 import pandas as pd
+
+from corvia.logger import get_logger
+logger = get_logger(__name__)
 
 @staticmethod
 def weighted_mean_and_error(
@@ -18,23 +28,50 @@ def weighted_mean_and_error(
     ----------
     values_arr : array-like
         The values to average.
-    errors_arr : array-like
-        The errors associated with each value.
-    weights_arr : array-like [optional]
+    errors_arr : array-like, optional
+        The errors associated with each value. If ``None``, treated as
+        entirely missing (equivalent to passing an all-NaN array).
+    weights_arr : array-like, optional
         The weights for each value.
         If None, uniform weights are assumed.
+    label : str, optional
+        Included in the console warning printed for the zero/single
+        non-zero weight edge cases, to identify which call site triggered it.
+    return_n_effective : bool, default = False
+        If ``True``, also return the effective sample size (Kish's
+        effective n) as a third value.
 
     Returns
     -------
-    tuple
-        A tuple containing the weighted mean and its error.
+    mean, error : float, float
+        The weighted mean and its standard error. When *return_n_effective*
+        is ``True``, a third value ``n_effective`` (float) is also returned.
+        All-NaN when there are no valid (non-NaN) values.
+
+    Raises
+    ------
+    ValueError
+        If *values_arr*, *errors_arr*, and *weights_arr* don't share the
+        same length; if errors are a mix of positive and non-positive/NaN
+        (must be all-positive or all-NaN); or if any weight is negative.
+
+    Notes
+    -----
+    Falls back to simpler formulas at the edges: a single valid value
+    returns that value and its own error directly; zero non-zero combined
+    weights returns NaN with a console warning; exactly one non-zero
+    combined weight returns that value/error directly with a warning.
+    Otherwise uses the standard weighted mean with the Cochran (1977)
+    weight correction for the variance estimate.
     """
     values = np.asarray(values_arr, dtype=np.float64)
     errors = np.asarray(errors_arr, dtype=np.float64) if errors_arr is not None else np.full_like(values, np.nan)
     weights = np.asarray(weights_arr, dtype=np.float64) if weights_arr is not None else np.ones_like(values)
 
     if not (len(values) == len(errors) == len(weights)):
-        raise ValueError("All input arrays must have the same length.")
+        error_msg = "Input arrays 'values_arr', 'errors_arr' and 'weights_arr' must have the same length."
+        logger.error(f"[{sys._getframe().f_code.co_name}] " + error_msg)
+        raise ValueError(error_msg)
     
     # A. Filter out invalid value entries
     valid_mask = (~np.isnan(values))
@@ -47,10 +84,14 @@ def weighted_mean_and_error(
 
     # B. Validate remaining input
     if not np.isnan(errors).all() and (np.isnan(errors).any() or np.any(errors <= 0)):
-        raise ValueError("Incorrect volume errors detected: errors should all be positive (> 0) or all be missing (np.nan)")
+        error_msg = "Incorrect volume errors detected: errors should all be positive (> 0) or all be missing (np.nan)."
+        logger.error(f"[{sys._getframe().f_code.co_name} - {label}] " + error_msg)
+        raise ValueError(error_msg)
     
     if np.isnan(weights).any() or np.any(weights < 0):
-        raise ValueError("Incorrect weights detected: weights should all be non-negative (>= 0)") 
+        error_msg = "Incorrect weights detected: weights should all be non-negative (>= 0)."
+        logger.error(f"[{sys._getframe().f_code.co_name} - {label}] " + error_msg)
+        raise ValueError(error_msg)
 
     # C. Calculate the combined weights considering both the provided weights and the inverse square of errors
     combined_weights = weights.copy()
@@ -64,10 +105,10 @@ def weighted_mean_and_error(
         return (values[0], err, 1) if return_n_effective else (values[0], err)
     
     if (combined_weights > 0.).sum() == 0:
-        print(f"Warning ({label}): All weights are zero. Returning NaN.")   
+        logger.warning(f"[{sys._getframe().f_code.co_name} - {label}] All weights are zero. Returning NaN.")   
         return (np.nan, np.nan, np.nan) if return_n_effective else (np.nan, np.nan)
     if (combined_weights > 0.).sum() == 1:
-        print(f"Warning ({label}): Only one non-zero weight. Returning that volume and its error.")
+        logger.warning(f"[{sys._getframe().f_code.co_name} - {label}] Only one non-zero weight. Returning that volume and its error.")
         idx = np.argmax(combined_weights)
         err = errors[idx]
         err = np.nan if (err <= 0) else err
@@ -117,11 +158,27 @@ def standardized_difference(
     pd.Series
         A continuous series of standardized differences aligned with the input series index.
         Contains np.nan where inputs are missing or total variance is non-positive.
+
+    Raises
+    ------
+    AssertionError
+        If the four input series don't all share an identical index.
     """
     # Ensure all series share identical index mapping for perfect vectorization
-    assert observed_val.index.equals(observed_err.index), "Index mismatch on observations."
-    assert observed_val.index.equals(baseline_val.index), "Index mismatch between observations and baseline."
-    assert observed_val.index.equals(baseline_err.index), "Index mismatch on baseline variances."
+    index_mismatch = False
+    error_msg = "Index mismatch between: "
+    if not observed_val.index.equals(observed_err.index): 
+        index_mismatch = True
+        error_msg += "observation values and errors, "
+    if not observed_val.index.equals(baseline_val.index):
+        index_mismatch = True 
+        error_msg += "observation and baseline values, "
+    if not observed_val.index.equals(baseline_err.index): 
+        index_mismatch = True
+        error_msg += "baseline values and errors."
+    if index_mismatch:
+        logger.error(f"[{sys._getframe().f_code.co_name}] " + error_msg)
+        raise IndexError(error_msg)
 
     # Compute combined pool variance: σ²_total = σ²_obs + σ²_baseline
     total_variance = ((observed_err ** 2) + (baseline_err ** 2)).replace(0, np.nan).fillna(1e-15)
