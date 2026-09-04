@@ -69,7 +69,7 @@ class VCFlowDataLoader:
     Parameters
     ----------
     csv_filenames : list of str, optional
-        Paths to the raw measurement CSVs. Only required for :meth:`aggregate` 
+        Paths to the raw measurement CSVs. Only required for :meth:`aggregate`
     time_delta : pd.Timedelta, optional
         The duration of a measurement in seconds.
     agg_freq : str, optional
@@ -144,7 +144,7 @@ class VCFlowDataLoader:
         volume_err_fn: Optional[Callable[[pd.DataFrame], pd.Series]] = None,
     ) -> None:
         self._csv_filenames: Optional[List[str]] = list(csv_filenames) if csv_filenames is not None else None
-        self._time_delta=time_delta if time_delta is not None else None
+        self._time_delta=time_delta
         self._agg_freq: str = agg_freq
         self._pae_factor: float = pae_factor
         self._start: Optional[pd.Timestamp] = pd.Timestamp(start) if start else None
@@ -167,10 +167,10 @@ class VCFlowDataLoader:
         Parameters
         ----------
         output_path : str, optional
-            When given, also saves the resulting report there. 
+            When given, also saves the resulting report there.
             Defaults to ``None`` (no file written).
         output_delimiter : str, optional
-            CSV delimiter used when *output_path* is given. 
+            CSV delimiter used when *output_path* is given.
             Defaults to ``";"``.
 
         Returns
@@ -224,7 +224,7 @@ class VCFlowDataLoader:
             An already-aggregated dataframe or a path to a saved report
             CSV. ``None`` (default) calls :meth:`aggregate` internally.
         delimiter : str, optional
-            CSV delimiter, used only when *report* is a path. 
+            CSV delimiter, used only when *report* is a path.
             Defaults to ``";"``.
 
         Returns
@@ -302,13 +302,14 @@ class VCFlowDataLoader:
         Returns
         -------
         pandas.Timedelta or None
-            ``None`` if the dataframe has fewer than 2 rows, 
+            ``None`` if the dataframe has fewer than 2 rows,
             or if no common interval can be found.
         """
         if len(df) < 2:
             return None
         df = df.sort_values(by=['LOCPOST', time_column])
         diffs = df.groupby('LOCPOST')[time_column].diff().dropna().unique()
+        logger.debug(f"Unique time intervals found: {diffs}")
         return diffs[0] if len(diffs) == 1 else None
 
     def _filter_period(self, df: pd.DataFrame, time_column: str, dT: Optional[pd.Timedelta] = None) -> pd.DataFrame:
@@ -459,7 +460,7 @@ class VCFlowDataLoader:
         Returns
         -------
         pandas.DataFrame
-            Rows whose sensor isn't attached to any section in *network* 
+            Rows whose sensor isn't attached to any section in *network*
             are dropped and logged via ``self.logger.warning``.
         """
         self.logger.info("> Mapping sensors to road sections...")
@@ -554,7 +555,7 @@ class VCFlowDataLoader:
         Notes
         -----
         Prefers ``timestamp`` (already computed by :meth:`aggregate`),
-        falls back to ``period_start``, and finally to midnight of 
+        falls back to ``period_start``, and finally to midnight of
         ``DATE`` for reports produced by the original, daily-only script.
 
         Raises

@@ -20,10 +20,21 @@ from datetime import datetime
 from typing import Optional
 import atexit
 
+# Define and Register Custom Progress Level (25)
+PROGRESS_LEVEL_NUM = 25
+logging.addLevelName(PROGRESS_LEVEL_NUM, "PROGRESS")
+
+def progress(self, message, *args, **kws):
+    if self.isEnabledFor(PROGRESS_LEVEL_NUM):
+        self._log(PROGRESS_LEVEL_NUM, message, args, **kws)
+
+# Attach method to logging.Logger class and module attribute
+logging.Logger.progress = progress
+logging.PROGRESS = PROGRESS_LEVEL_NUM
+
 
 # Global state to track if logging has been configured
 _logging_configured = False
-
 # Name of the package-level logger. Must match the top-level import name
 # (e.g. "corvia" in "corvia.framework.network") for child loggers obtained
 # via get_logger(__name__) to inherit this configuration.
@@ -50,7 +61,7 @@ def configure_logging(
 
     Parameters
     ----------
-    log_level : int, default = logging.INFO
+    log_level : int, default = logging.PROGRESS
         Root logger level for the ``corvia`` logger.
     console_level : int, optional, default = None
         Console output level. Falls back to *log_level* when ``None``.
