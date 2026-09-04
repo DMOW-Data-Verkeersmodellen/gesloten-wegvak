@@ -21,6 +21,7 @@ requires-python = ">=3.11"
 
 [project.optional-dependencies]
 dev = [
+    "nbwipers",
     "nbstripout",
     "pre-commit"
 ]
@@ -34,3 +35,7 @@ extra_keys = [
     "metadata.kernelspec",
     "metadata.language_info"
 ]
+
+[tool.nbwipers]
+strip-kernel-info = true
+id-action = "drop"

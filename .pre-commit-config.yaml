@@ -1,8 +1,18 @@
 repos:
-  - repo: https://github.com/kynan/nbstripout
-    rev: 0.9.0
+  - repo: https://github.com/felixgwilliams/nbwipers-pre-commit
+    rev: v0.7.0
     hooks:
-      - id: nbstripout
-        args: [
-          "--extra-keys", "metadata.kernelspec metadata.language_info"
-        ]
+      # FAILS the commit if the developer forgot to run `nbwipers install local`
+      - id: nbwipers-check-install
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Prevents files larger than 5MB from being committed
+      - id: check-added-large-files
+        args: ['--maxkb=5120']
+      # Prevents committing unresolved git conflict markers (<<<<<<<)
+      - id: check-merge-conflict
+      # Ensures trailing spaces don't pollute git diffs
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
