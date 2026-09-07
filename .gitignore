@@ -1,7 +1,7 @@
 # General
 data/
 testing/
-testing*
+test*
 output/
 
 # SVM files
@@ -23,6 +23,17 @@ output/
 *.qgz
 *.xml
 
+# Output and reporting file types
+*.png
+*.jpg
+*.pdf
+*.ppt
+*.pptx
+*.doc
+*.docx
+*.xls
+*.xlsx
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -33,6 +44,7 @@ __pycache__/
 
 # Visual Studio
 .vs/
+.vscode/
 
 # Distribution / packaging
 .Python
@@ -210,9 +222,9 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  and can be added to the global gitignore or merged into this file. However, if you prefer,
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 

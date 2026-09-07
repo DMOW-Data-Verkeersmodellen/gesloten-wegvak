@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corvia"  # The name used in 'pip install'
+version = "0.1.0"
+authors = [
+    {name = "Bob Oeyen", email = "bob.oeyen@mow.vlaanderen.be"},
+    {name = "Iris Grant", email = "iris.grant@mow.vlaanderen.be"}
+]
+dependencies = [
+    "pandas>=3.0.0",
+    "numpy>=1.26.0",
+    "tqdm>=4.60.0",
+    "geopandas>=1.0.0",
+    "shapely>=2.0.0",
+    "scipy>=1.10.0",
+]
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = [
+    "nbwipers",
+    "nbstripout",
+    "pre-commit"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.nbstripout]
+keep_count = false
+extra_keys = [
+    "metadata.kernelspec",
+    "metadata.language_info"
+]
+
+[tool.nbwipers]
+strip-kernel-info = true
+id-action = "drop"

@@ -1,0 +1,2 @@
+*.ipynb filter=nbwipers
+*.ipynb diff=nbwipers
