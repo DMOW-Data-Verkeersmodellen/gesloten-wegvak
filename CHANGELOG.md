@@ -21,5 +21,5 @@ Put new changes into the unrealesed section
 ---
 
 
-## [1.0.0] - 2025-12-19
+## [1.0.0] - 2026/09/14
 - Initial preliminary release of existing code
