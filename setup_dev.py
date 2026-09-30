@@ -24,20 +24,17 @@ def main():
         os.environ["PRE_COMMIT_HOME"] = str(local_cache)
         print(f"--> Configured PRE_COMMIT_HOME at {local_cache}\n")
 
-    # 2. Install package in editable mode with dev dependencies
-    run([sys.executable, "-m", "pip", "install", "-e", ".[dev]"])
-
-    # 3. Install pre-commit hooks using active Python interpreter
+    # 2. Install pre-commit hooks using active Python interpreter
     run([sys.executable, "-m", "pre_commit", "install"])
 
-    # 4. Pre-build hook environments into local cache (prevents commit delays later)
+    # 3. Pre-build hook environments into local cache (prevents commit delays later)
     print("\n--> Pre-building pre-commit environments on local drive...")
     run([sys.executable, "-m", "pre_commit", "install-hooks"])
 
-    # 5. Register nbwipers as local git filter
+    # 4. Register nbwipers as local git filter
     run(["nbwipers", "install", "local"])
 
-    print("\n✅ Setup complete! Pre-commit hooks are pre-built on local C: drive.")
+    print("\n✅ Developer environment initialised! Pre-commit hooks are pre-built on local C: drive.")
 
 if __name__ == "__main__":
     main()

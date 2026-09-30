@@ -77,7 +77,7 @@ git checkout latest-version
 ```
 
 ### 5 — Installeer de package en de dependencies
-
+Wil je de code enkel gebruiken, installeer dan gewoon de package met pip:
 ```bash
 pip install -e .
 ```
@@ -87,7 +87,8 @@ De `-e` flag installeert het project "editable", zodat lokale codewijzigingen
 meegenomen zonder herinstallatie.
 
 Wil je bijdragen aan de code, installeer dan ook de optionele
-development-dependencies en voer het dev setup-script uit:
+development-dependencies en voer het setup_dev.py-script uit om
+de development-omgeving te initialiseren:
 ```bash
 pip install -e ".[dev]"
 python setup_dev.py
