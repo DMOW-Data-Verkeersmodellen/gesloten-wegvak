@@ -2,16 +2,16 @@
 topology.py
 ===========
 Road network primitives.  No external dependencies.
- 
+
 Object hierarchy after compilation::
- 
+
     Node  ←──  Link  ──→  Node
                 │
                 ├── CountLocation   (optional sensor)
                 └── RoadSection     (aggregate container)
- 
+
     RoadSection  ◄──►  RoadSection  (direct neighbour references)
- 
+
 Geometry is intentionally absent from all classes here.  Spatial data
 lives in GeoPandas GeoDataFrames managed by :class:`~network.Network`,
 accessed via ``network.nodes_gdf.loc[node.node_id]``.
@@ -60,7 +60,7 @@ class Node:
     def summary(self) -> dict:
         """
         Return a dictionary of key metrics for this node.
- 
+
         Returns
         -------
         dict
@@ -71,7 +71,7 @@ class Node:
             "in_degree": self.in_degree,
             "out_degree": self.out_degree
         }
- 
+
     def __repr__(self) -> str:
         return f"Node({self._node_id} | in={self.in_degree}, out={self.out_degree})"
 
@@ -88,27 +88,27 @@ class Node:
     def incoming_links(self) -> List[Link]:
         """list of Link : Links arriving at this node *(read-only snapshot)*."""
         return list(self._incoming_links)
- 
+
     @property
     def outgoing_links(self) -> List[Link]:
         """list of Link : Links departing from this node *(read-only snapshot)*."""
         return list(self._outgoing_links)
-    
+
     @property
     def in_degree(self) -> int:
         """int : Number of incoming links."""
         return len(self._incoming_links)
- 
+
     @property
     def out_degree(self) -> int:
         """int : Number of outgoing links."""
         return len(self._outgoing_links)
- 
+
     @property
     def degree(self) -> int:
         """int : Total number of connected links (in + out)."""
         return self.in_degree + self.out_degree
- 
+
     def neighbours(self, direction: str = 'downstream') -> List[Node]:
         """
         List the nodes reachable from this node in one hop.
@@ -143,7 +143,7 @@ class Node:
     def _register_incoming(self, link: Link) -> None:
         """
         Register *link* as arriving at this node.
- 
+
         Parameters
         ----------
         link : Link
@@ -154,11 +154,11 @@ class Node:
             logger.error(error_msg)
             raise ValueError(error_msg)
         self._incoming_links.append(link)
- 
+
     def _register_outgoing(self, link: Link) -> None:
         """
         Register *link* as departing from this node.
- 
+
         Parameters
         ----------
         link : Link
@@ -169,7 +169,7 @@ class Node:
             logger.error(error_msg)
             raise ValueError(error_msg)
         self._outgoing_links.append(link)
- 
+
     def _deregister_incoming(self, link: Link) -> None:
         """Remove *link* from the incoming list (called on link deletion)."""
         try:
@@ -178,7 +178,7 @@ class Node:
             error_msg = f"Cannot deregister: link '{link.link_id}' not found in incoming links of {self}."
             logger.error(error_msg)
             raise ValueError(error_msg)
- 
+
     def _deregister_outgoing(self, link: Link) -> None:
         """Remove *link* from the outgoing list (called on link deletion)."""
         try:
@@ -187,7 +187,7 @@ class Node:
             error_msg = f"Cannot deregister: link '{link.link_id}' not found in outgoing links of {self}."
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
+
     # ------------------------------------------------------------------
     # Public query helpers
     # ------------------------------------------------------------------
@@ -195,50 +195,67 @@ class Node:
     def is_junction(self) -> bool:
         """
         Determine whether this node acts as a real junction.
- 
+
         A node is a junction if it has more than one incoming **or** more
         than one outgoing link (i.e. a merge or a diverge).
- 
+
         Returns
         -------
         bool
             True when junction of more then two links.
         """
         return (self.in_degree > 1) or (self.out_degree > 1)
-    
+
     def is_passthrough(self) -> bool:
         """
         Return ``True`` when the node has exactly one incoming and one
-        outgoing link and carries no topological significance.
- 
+        outgoing link and the two continue in the same direction of travel,
+        as this means the node carries no topological significance.
+
+        A node with one incoming and one outgoing link that are each other's
+        reverse (incoming link ``A -> N``, outgoing link ``N -> A``) is a
+        dead end (e.g. a cul-de-sac, or the cut edge of a network extract),
+        not a pass-through: traffic turns around there, so merging the two
+        links into one section would create a closed A -> N -> A loop.
+
         Returns
         -------
         bool
+
+        Notes
+        -----
+        TODO: turn restrictions are not modelled. A future version could
+        store the allowed movements per node and use them here (and in
+        section compilation) instead of assuming every incoming link may
+        continue onto every outgoing link.
         """
-        return (self.in_degree == 1 and self.out_degree == 1)
- 
+        if self.in_degree != 1 or self.out_degree != 1:
+            return False
+        incoming, outgoing = self._incoming_links[0], self._outgoing_links[0]
+        return incoming.start_node is not outgoing.end_node
+
     def is_source(self) -> bool:
         """
         Check whether the node is a source (no incoming links).
- 
+
         Returns
         -------
         bool
             True when only outgoing links.
         """
         return (self.in_degree == 0) and (self.out_degree > 0)
- 
+
     def is_sink(self) -> bool:
         """
         Check whether the node is a sink (no outgoing links).
- 
+
         Returns
         -------
         bool
             True when only incoming links.
         """
         return (self.in_degree > 0) and (self.out_degree == 0)
- 
+
     def get_link_to(self, other: Node) -> Optional[Link]:
         """
         Return the direct link from this node to *other*, if it exists.
@@ -261,12 +278,12 @@ class Node:
     def get_link_from(self, other: Node) -> Optional[Link]:
         """
         Return the direct link to this node from *other*, if it exists.
- 
+
         Parameters
         ----------
         other : Node
             The candidate downstream node.
- 
+
         Returns
         -------
         Link or None
@@ -276,8 +293,8 @@ class Node:
             if link.start_node is other:
                 return link
         return None
-    
-    
+
+
 class Link:
     """
     Represents a raw directed road segment (arc).
@@ -326,7 +343,7 @@ class Link:
         self._end_node: Node = end_node
         self._sensor_locations: List[SensorLocation] = []
         self._parent_section: Optional[RoadSection] = None
- 
+
         # Auto-register with the endpoint nodes
         start_node._register_outgoing(self)
         end_node._register_incoming(self)
@@ -334,7 +351,7 @@ class Link:
     def summary(self) -> dict:
         """
         Return a dictionary of key attributes for this link.
- 
+
         Returns
         -------
         dict
@@ -348,26 +365,26 @@ class Link:
             "sensor_count": len(self._sensor_locations),
             "is_assigned": self.is_assigned,
         }
- 
+
     def __repr__(self) -> str:
         return (
             f"Link({self._link_id} | {self._start_node.node_id} -> {self._end_node.node_id})"
         )
-    
+
     # ------------------------------------------------------------------
     # Property getters and setters
     # ------------------------------------------------------------------
- 
+
     @property
     def link_id(self) -> str:
         """str : Unique identifier of the link *(read-only)*."""
         return self._link_id
- 
+
     @property
     def start_node(self) -> Node:
         """Node : Upstream node *(read-only)*."""
         return self._start_node
- 
+
     @property
     def end_node(self) -> Node:
         """Node : Downstream node *(read-only)*."""
@@ -377,30 +394,30 @@ class Link:
     def sensor_locations(self) -> Optional[SensorLocation]:
         """list of SensorLocation : Sensors attached to this link *(read-only)*."""
         return list(self._sensor_locations)
- 
+
     @property
     def parent_section(self) -> Optional[RoadSection]:
         """RoadSection or None : Section that owns this link *(read-only)*."""
         return self._parent_section
- 
+
     @property
     def has_sensor(self) -> bool:
         """bool : ``True`` when at least one :class:`SensorLocation` is attached."""
         return len(self._sensor_locations) > 0
- 
+
     @property
     def is_assigned(self) -> bool:
         """bool : ``True`` when this link belongs to a :class:`RoadSection`."""
         return self._parent_section is not None
-    
+
     # ------------------------------------------------------------------
     # Sensor management
     # ------------------------------------------------------------------
- 
+
     def attach_sensor(self, sensor_location: SensorLocation) -> List[sensor_locations]:
         """
         Attach a :class:`SensorLocation` sensor to this link.
- 
+
         Parameters
         ----------
         sensor_location : SensorLocation
@@ -417,16 +434,16 @@ class Link:
             raise ValueError(error_msg)
         logger.debug("Sensor '%s' attached to link '%s'.", sensor_location.location_id, self._link_id)
         return self._sensor_locations.append(sensor_location)
- 
+
     def detach_sensor(self, location_id: str) -> Optional[SensorLocation]:
         """
         Remove and return a specific sensor by its unique ID.
- 
+
         Parameters
         ----------
         location_id : str
             Identifier of the sensor to remove.
-        
+
         Returns
         -------
         SensorLocation or None
@@ -438,20 +455,20 @@ class Link:
                 return self._sensor_locations.pop(idx)
         logger.warning(f"detach_sensor: sensor {location_id} not found on link {self._link_id}; nothing removed")
         return None
- 
+
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------
- 
+
     def create_reverse(self) -> Link:
         """
         Create a new :class:`Link` with start and end nodes swapped.
- 
+
         The reversed link has ``"_rev"`` appended to the original ID,
         carries no sensor, and belongs to no section.  The geometry
         string is preserved as-is (caller is responsible for reversing
         coordinate order if needed).
- 
+
         Returns
         -------
         Link
@@ -462,18 +479,18 @@ class Link:
             start_node=self._end_node,
             end_node=self._start_node,
         )
- 
+
     def is_adjacent_to(self, other: Link, direction: str = 'downstream') -> bool:
         """
         Check whether *other* can follow this link in a chain.
- 
+
         Parameters
         ----------
         other : Link
             The candidate next link.
         direction : str, default = 'downstream'
             Direction of traversal ('downstream' or 'upstream').
- 
+
         Returns
         -------
         bool
@@ -519,7 +536,7 @@ class SensorLocation:
     ValueError
         If *lane_count* is negative.
     """
- 
+
     def __init__(self, location_id: str, link_id: str, name: Optional[str] = None, lane_count: int = 0) -> None:
         if lane_count < 0:
             error_msg = f"Invalid lane count {lane_count} for sensor {location_id} on link {link_id}; must be >= 1 or 0 (unknown)."
@@ -533,7 +550,7 @@ class SensorLocation:
     def summary(self) -> dict:
         """
         Return a dictionary summarising this sensor's metadata.
- 
+
         Returns
         -------
         dict
@@ -545,38 +562,38 @@ class SensorLocation:
             "name": self._name,
             "lane_count": self._lane_count,
         }
- 
+
     def __repr__(self) -> str:
         return f"SensorLocation({self._location_id} on Link {self._link_id})"
- 
+
     # ------------------------------------------------------------------
     # Property getters and setters
     # ------------------------------------------------------------------
- 
+
     @property
     def location_id(self) -> str:
         """str : Unique identifier of the sensor *(read-only)*."""
         return self._location_id
- 
+
     @property
     def link_id(self) -> str:
         """str : Identifier of the host link *(read-only)*."""
         return self._link_id
- 
+
     @property
     def name(self) -> Optional[str]:
         """str or None : Human-readable station label."""
         return self._name
- 
+
     @name.setter
     def name(self, value: Optional[str]) -> None:
         self._name = value
- 
+
     @property
     def lane_count(self) -> int:
         """int : Number of lanes covered by this sensor."""
         return self._lane_count
- 
+
     @lane_count.setter
     def lane_count(self, value: int) -> None:
         """
@@ -597,7 +614,7 @@ class SensorLocation:
     def is_lane_count_known(self) -> bool:
         """bool : ``True`` if lane count is known, ``False`` otherwise."""
         return self._lane_count > 0
- 
+
     @property
     def display_name(self) -> str:
         """str : ``name`` if set, otherwise falls back to ``location_id``."""
@@ -659,19 +676,19 @@ class RoadSection:
             logger.error(error_msg)
             raise ValueError(error_msg)
         self._validate_chain(links)
- 
+
         self._section_id: str = section_id
         self._links: List[Link] = list(links)
- 
+
         # Back-reference each link to this section
         for link in self._links:
             link._parent_section = self
 
         logger.debug(
-            "RoadSection '%s' created with %d link(s) (%s -> %s).", 
+            "RoadSection '%s' created with %d link(s) (%s -> %s).",
             section_id, len(self._links), self.entry_node, self.exit_node
         )
-            
+
     def summary(self) -> dict:
         """
         Return a dictionary summarising the section's key metrics.
@@ -700,17 +717,17 @@ class RoadSection:
     # ------------------------------------------------------------------
     # Property getters and setters
     # ------------------------------------------------------------------
-    
+
     @property
     def section_id(self) -> str:
         """str : Unique identifier of the section *(read-only)*."""
         return self._section_id
-    
+
     @property
     def links(self) -> List[Link]:
         """list of Link : Ordered links of the section *(read-only)*."""
         return list(self._links)
-    
+
     @property
     def link_count(self) -> int:
         """int : Total number of links in this section."""
@@ -723,7 +740,7 @@ class RoadSection:
         for link in self.links:
             locations.extend(link.sensor_locations)
         return locations
-    
+
     @property
     def sensor_count(self) -> int:
         """int : Number of links that carry a sensor."""
@@ -738,12 +755,12 @@ class RoadSection:
     def entry_node(self) -> Node:
         """Node : Upstream boundary node of the section."""
         return self._links[0].start_node
- 
+
     @property
     def exit_node(self) -> Node:
         """Node : Downstream boundary node of the section."""
         return self._links[-1].end_node
-    
+
     @property
     def upstream_in(self) -> List[RoadSection]:
         """list of RoadSection : Sections that feed directly into this one *(read-only)*."""
@@ -752,7 +769,7 @@ class RoadSection:
             for link in self.entry_node.incoming_links
             if link.parent_section is not None
         })
-    
+
     @property
     def upstream_out(self) -> List[RoadSection]:
         """list of RoadSection : Sections leaving the entry node besides this one *(read-only)*."""
@@ -761,7 +778,7 @@ class RoadSection:
             for link in self.entry_node.outgoing_links
             if (link.parent_section is not None) and (link.parent_section is not self)
         })
- 
+
     @property
     def downstream_in(self) -> List[RoadSection]:
         """list of RoadSection : Sections entering the exit node besides this one *(read-only)*."""
@@ -770,7 +787,7 @@ class RoadSection:
             for link in self.exit_node.incoming_links
             if (link.parent_section is not None) and (link.parent_section is not self)
         })
-    
+
     @property
     def downstream_out(self) -> List[RoadSection]:
         """list of RoadSection : Sections leaving the exit node *(read-only)*."""
@@ -779,16 +796,16 @@ class RoadSection:
             for link in self.exit_node.outgoing_links
             if link.parent_section is not None
         })
-    
+
     # ------------------------------------------------------------------
     # Topology management
     # ------------------------------------------------------------------
- 
+
     @staticmethod
     def _validate_chain(links: List[Link]) -> None:
         """
         Verify that consecutive links share boundary nodes.
- 
+
         Parameters
         ----------
         links : list of Link
@@ -802,7 +819,7 @@ class RoadSection:
                 )
                 logger.error(error_msg)
                 raise ValueError(error_msg)
-    
+
     def append_link(self, link: Link) -> None:
         """
         Append a new link to the *end* of the section.
@@ -830,16 +847,16 @@ class RoadSection:
         self._links.append(link)
         link._parent_section = self
         logger.debug("Link '%s' appended to section '%s'.", link.link_id, self._section_id)
- 
+
     def get_link_by_id(self, link_id: str) -> Optional[Link]:
         """
         Look up a link inside this section by its identifier.
- 
+
         Parameters
         ----------
         link_id : str
             The link identifier to search for.
- 
+
         Returns
         -------
         Link or None
@@ -849,22 +866,22 @@ class RoadSection:
             if link.link_id == link_id:
                 return link
         return None
- 
+
     def iter_links(self) -> Iterator[Link]:
         """
         Yield links in topological order from entry to exit.
- 
+
         Yields
         ------
         Link
             Each link in the section, in order.
         """
         yield from self._links
- 
+
     def iter_sensors(self) -> Iterator[SensorLocation]:
         """
         Yield all sensors in the section in link order.
- 
+
         Yields
         ------
         SensorLocation
