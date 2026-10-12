@@ -49,12 +49,12 @@ class FlowStore():
     SOURCE_REC = "reconstructed"
     SOURCE_RES = "resolved"
 
-    COLUMNS = ["road_section_id", "timestamp", "vehicle_type", 
-               "volume", "volume_err", "source_type", "source_id", 
+    COLUMNS = ["road_section_id", "timestamp", "vehicle_type",
+               "volume", "volume_err", "source_type", "source_id",
                "weight", "screening", "validation"]
 
     VTYPE_DEFAULTS = ("PW", "VR", "TOTAL", "PAE")
-    
+
     SCREENING_STATES = {"unknown", "accepted", "disputed", "held", "void", "NA"}
     VALIDATION_STATES = {"pending", "verified", "conforming", "dismissed", "rejected", "unresolved", "NA"}
 
@@ -66,7 +66,7 @@ class FlowStore():
 
     @classmethod
     def from_dataframe(
-        cls, 
+        cls,
         df: pd.DataFrame,
         vehicle_types: Optional[Tuple[str, ...]] = VTYPE_DEFAULTS,
     ) -> FlowStore:
@@ -189,7 +189,7 @@ class FlowStore():
         source_id: Optional[str] = None,
     ) -> None:
         """
-        Purges existing resolved (SOURCE_RES) rows. 
+        Purges existing resolved (SOURCE_RES) rows.
 
         Parameters
         ----------
@@ -304,9 +304,9 @@ class FlowStore():
         #    columns would otherwise silently add new, mostly-empty
         #    columns to the matrix instead of raising.
         df_copy = df_copy[self.COLUMNS]
-        
+
         self._df = pd.concat([self._df, df_copy], ignore_index=True)
-        self.logger.info(f"append_estimates () appended {len(df_copy)} row(s); store now holds {len(self._df)} row(s).")
+        self.logger.info(f"append_estimates() appended {len(df_copy)} row(s); store now holds {len(self._df)} row(s).")
 
     def load_raw_observations(self, network: Network, counts_df: pd.DataFrame) -> None:
         """
@@ -318,7 +318,7 @@ class FlowStore():
             The compiled network infrastructure map.
         counts_df : pd.DataFrame
             Must contain columns: ['timestamp', 'location_id', 'vehicle_type', 'volume']
-            Optional column: ['volume_err'] for error estimates, 
+            Optional column: ['volume_err'] for error estimates,
             if not provided, defaults to NaN.
 
         Raises
@@ -345,7 +345,7 @@ class FlowStore():
             records["volume_err"] = np.nan  # Default to NaN if no error column is provided
         if not "screening" in records.columns:
             records["screening"] = "unknown"
-        
+
         # Strip measurements from any location that couldn't be mapped
         unmapped = int(records["road_section_id"].isna().sum())
         if unmapped:
@@ -382,7 +382,7 @@ class FlowStore():
         source_types : tuple of str, optional
             Only rows with these source types contribute.
             Defaults to ``(SOURCE_OBS, SOURCE_REC)`` so both readings
-            and reconstructions are used. Pass ``(SOURCE_REC,)`` to 
+            and reconstructions are used. Pass ``(SOURCE_REC,)`` to
             only include reconstructions in the consensus.
 
         Returns
@@ -408,7 +408,7 @@ class FlowStore():
         sub = self._df[mask].dropna(subset=["volume"])
         if sub.empty:
             return np.nan, np.nan
-        
+
         v = sub["volume"].to_numpy(dtype="float64")
         e = sub["volume_err"].to_numpy(dtype="float64")
         w = sub["weight"].to_numpy(dtype="float64")
